@@ -1,0 +1,24 @@
+# Docker image archives (built by tools/deploy.sh; large, contain third-party binaries)
+*.tar.gz
+
+# Build output
+build/
+__pycache__/
+
+# WAGO SDK headers: proprietary ("PROPRIETARY RIGHTS ... license agreement").
+# Import them yourself with tools/import-sdk-packages.sh (see sdk/README.md).
+# OsCommon.h is our own minimal stand-in and stays in the repo.
+sdk/include/dal/
+sdk/include/ldkc_kbus_information.h
+
+# WAGO application note (download it from wago.com instead)
+Information/**/*.pdf
+
+# CODESYS: only the .project file is versioned
+codesys/*.opt
+codesys/*.compileinfo
+codesys/*.bootinfo
+codesys/*.bootinfo_guids
+codesys/*.precompilecache
+codesys/*.~u
+codesys/*.backup

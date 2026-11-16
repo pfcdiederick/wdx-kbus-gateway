@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KBUS Gateway</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--fg:#1d2329;--muted:#66717c;--line:#dde2e7;--accent:#6ec800;--accent-fg:#0d2600;--off:#c9d0d6;--err:#d0342c}
+@media (prefers-color-scheme:dark){:root{--bg:#14181c;--card:#1e2328;--fg:#e8ecef;--muted:#98a3ad;--line:#323a42;--off:#3c454e;--accent-fg:#0d2600}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;align-items:center;padding:1rem 16px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:1.15rem;margin:0}
+.stat{color:var(--muted);font-size:.85rem}.stat b{color:var(--fg);font-weight:600}
+.badge{padding:.1rem .55rem;border-radius:99px;font-size:.8rem;font-weight:600;background:var(--accent);color:var(--accent-fg)}
+.badge.bad{background:var(--err);color:#fff}.badge.sim{background:#f0b400;color:#2b2000}
+main{max-width:1200px;margin:0 auto;padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+h2{font-size:1rem;margin:0 0 .6rem;display:flex;justify-content:space-between}
+h2 span{color:var(--muted);font-weight:400;font-size:.85rem}
+.row{display:flex;align-items:center;gap:.6rem;padding:.3rem 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.row a{color:var(--fg);text-decoration:none;font-family:ui-monospace,monospace;min-width:4.2rem}
+.row a:hover{text-decoration:underline}
+.meta{color:var(--muted);font-size:.78rem;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.led{width:14px;height:14px;border-radius:50%;background:var(--off);flex:none}
+.led.on{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+.val{font-family:ui-monospace,monospace;min-width:4.5rem;text-align:right}
+button{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;padding:.2rem .7rem;cursor:pointer}
+button.on{background:var(--accent);color:var(--accent-fg);border-color:transparent}
+input{font:inherit;width:6rem;padding:.15rem .35rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.empty{color:var(--muted);font-size:.9rem}
+#modules{grid-column:1/-1;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.88rem}
+th,td{text-align:left;padding:.3rem .5rem;border-top:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:500;border-top:0}
+#msg{color:var(--err);font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>KBUS Gateway</h1>
+  <span id="badge" class="badge">…</span>
+  <span class="stat">cycles <b id="cycles">-</b></span>
+  <span class="stat">cycle <b id="cycle">-</b></span>
+  <span class="stat">errors <b id="errors">-</b></span>
+  <span id="msg"></span>
+</header>
+<main>
+  <section><h2>Digital inputs <span id="n-DI"></span></h2><div id="DI"></div></section>
+  <section><h2>Digital outputs <span id="n-DO"></span></h2><div id="DO"></div></section>
+  <section><h2>Analog inputs <span id="n-AI"></span></h2><div id="AI"></div></section>
+  <section><h2>Analog outputs <span id="n-AO"></span></h2><div id="AO"></div></section>
+  <section id="modules"><h2>Modules</h2><table><thead><tr><th>Pos</th><th>Type</th><th>In bits</th><th>Out bits</th><th>Channels</th></tr></thead><tbody id="mods"></tbody></table></section>
+</main>
+<script>
+const KINDS = ['DI', 'DO', 'AI', 'AO'];
+const shape = {};          // channel count per kind, to know when to rebuild
+let token = '';
+const $ = id => document.getElementById(id);
+const msg = t => { $('msg').textContent = t || ''; };
+
+async function write(path, value) {
+  const headers = { 'Content-Type': 'text/plain' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const r = await fetch(path, { method: 'POST', headers, body: String(value) });
+  if (r.status === 401) {
+    token = prompt('API token required for writing') || '';
+    if (token) return write(path, value);
+  }
+  if (!r.ok) throw new Error(await r.text());
+  msg('');
+}
+
+function build(kind, list) {
+  const box = $(kind);
+  box.replaceChildren();
+  $('n-' + kind).textContent = list.length ? list.length + ' ch' : '';
+  if (!list.length) { box.innerHTML = '<div class="empty">none</div>'; return; }
+  for (const c of list) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<a href="${c.path}" title="open ${c.path}">${c.path.slice(1)}</a>` +
+      `<span class="meta">pos ${c.module} · ${c.moduleType} · ch ${c.moduleChannel}</span>`;
+    if (kind === 'DI') {
+      row.append(Object.assign(document.createElement('span'), { className: 'led' }));
+    } else if (kind === 'DO') {
+      const b = document.createElement('button');
+      b.onclick = () => write(c.path, b.classList.contains('on') ? 0 : 1).then(poll).catch(e => msg(e.message));
+      row.append(b);
+    } else if (kind === 'AI') {
+      row.append(Object.assign(document.createElement('span'), { className: 'val' }));
+    } else {
+      const i = Object.assign(document.createElement('input'), { type: 'number', step: 1 });
+      const b = Object.assign(document.createElement('button'), { textContent: 'Set' });
+      const send = () => write(c.path, i.value).then(() => { i.blur(); poll(); }).catch(e => msg(e.message));
+      b.onclick = send;
+      i.onkeydown = e => { if (e.key === 'Enter') send(); };
+      row.append(i, b);
+    }
+    box.append(row);
+  }
+}
+
+function update(kind, list) {
+  const rows = $(kind).querySelectorAll('.row');
+  list.forEach((c, n) => {
+    const row = rows[n];
+    if (!row) return;
+    if (kind === 'DI') row.querySelector('.led').classList.toggle('on', c.value === 1);
+    else if (kind === 'DO') {
+      const b = row.querySelector('button');
+      b.classList.toggle('on', c.value === 1);
+      b.textContent = c.value === 1 ? 'ON' : 'OFF';
+    } else if (kind === 'AI') row.querySelector('.val').textContent = c.value;
+    else {
+      const i = row.querySelector('input');
+      if (document.activeElement !== i) i.value = c.value;
+    }
+  });
+}
+
+async function poll() {
+  try {
+    const [io, st] = await Promise.all([fetch('/api/io').then(r => r.json()),
+                                        fetch('/api/status').then(r => r.json())]);
+    for (const k of KINDS) {
+      if (shape[k] !== io[k].length) { build(k, io[k]); shape[k] = io[k].length; }
+      update(k, io[k]);
+    }
+    const badge = $('badge');
+    badge.textContent = st.backend === 'simulation' ? 'SIMULATION' : (st.healthy ? 'KBUS running' : 'KBUS error');
+    badge.className = 'badge' + (st.backend === 'simulation' ? ' sim' : st.healthy ? '' : ' bad');
+    $('cycles').textContent = st.cycles;
+    $('cycle').textContent = `${st.cycleMs} ms (${st.lastCycleUs} µs)`;
+    $('errors').textContent = st.errors;
+  } catch (e) {
+    $('badge').textContent = 'offline';
+    $('badge').className = 'badge bad';
+  }
+}
+
+fetch('/api/modules').then(r => r.json()).then(mods => {
+  $('mods').innerHTML = mods.map(m =>
+    `<tr><td>${m.position}</td><td>${m.type}</td><td>${m.inBits}</td><td>${m.outBits}</td><td>${m.channels}</td></tr>`).join('');
+});
+poll();
+setInterval(poll, 500);
+</script>
+</body>
+</html>
