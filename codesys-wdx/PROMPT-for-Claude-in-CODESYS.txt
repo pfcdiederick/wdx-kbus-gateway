@@ -50,8 +50,9 @@ GVL_KbusRest, F_AppendStr, FB_HttpTransaction, FB_KbusRestIo, PLC_PRG.
   FB_WdxKbusIo: same inputs (xEnable, uiNumDI/DO/AI/AO, axDOSet, auiAOSet, tInterval,
   tTimeout) and outputs (axDI, auiAI, axDO, auiAO, xOnline, udiErrors, tLastExchange,
   sLastError, udiExchanges); iLastStatus is new.
-- The gateway (version 1.1.3) still answers 'POST /ALL', so the old program keeps working
-  until the new one is downloaded.
+- Since gateway version 2.0.0 the wdx data layer is the ONLY interface: 'POST /ALL' and
+  '/DO/1' answer 404/405. The old program stops switching outputs as soon as gateway 2.0.0
+  runs, until this new program is downloaded. Do not use /ALL or single channels anymore.
 
 STEPS
 1. Add the library 'CAA Net Base Services' (namespace NBS) if it is missing.
@@ -378,7 +379,7 @@ OBJECT: FB_WdxKbusIo
 // FB_WdxKbusIo  -  cyclic KBus I/O through the wdx data layer of kbus-gateway
 // Object type in CODESYS: POU, Function Block, language ST
 // Uses: FB_HttpTransaction, F_AppendStr, F_FindBytes, GVL_KbusRest
-// Needs kbus-gateway 1.1.0 or newer (wdx interface /wda/parameters, filter[id]).
+// Needs kbus-gateway 1.1.0 or newer (wdx interface /wda/parameters, filter[id]); 2.0.0 has only this interface.
 //
 // Every exchange is the SAME fixed sequence (constant timing):
 //   1. PATCH /wda/parameters/0-0-kbus-digitaloutputvalues   (if uiNumDO > 0)  -> 204

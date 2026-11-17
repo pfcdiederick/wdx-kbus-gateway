@@ -16,9 +16,9 @@
             "problemMatcher": []
         },
         {
-            "label": "test: reference + bulk + wdx (simulation on port 8000)",
+            "label": "test: wdx data layer (simulation on port 8000)",
             "type": "shell",
-            "command": "python3 tools/test-rest.py 127.0.0.1 sim && python3 tools/test-rest.py 127.0.0.1 bulk && python3 tools/test-rest.py 127.0.0.1 wda",
+            "command": "python3 tools/test-rest.py 127.0.0.1 wda",
             "problemMatcher": []
         },
         {

@@ -139,7 +139,7 @@ Rules for the client:
 | Part | Time |
 |---|---|
 | gateway: any wdx request (measured on the PC) | < 0.1 ms |
-| one complete request on the PFC300, incl. TCP connect/close (curl, 300×, native 1.1.2) | median 1.15 ms, p95 1.8 ms, max 11 ms; wdx GET/PATCH ≈ `/ALL` |
+| one complete request on the PFC300, incl. TCP connect/close (curl, native gateway) | median 1.15–1.35 ms, p95 1.8–2.0 ms, ~3 % around 10 ms (CODESYS real-time threads) |
 | gateway: KBus cycle | `KBUS_CYCLE_MS` (default 10 ms, 1–40), real-time SCHED_FIFO 40 |
 | CODESYS: one HTTP request | a few task cycles (connect, write, read) |
 | CODESYS: one exchange | 2 requests (DO + GET), 3 with AO |
@@ -166,10 +166,9 @@ Settings that matter:
 
 Limits: HTTP over TCP is fast but not hard real-time. Expect the exchange time
 to vary by about one task cycle. For hard real-time I/O, let CODESYS drive the
-KBus directly (KBus in the device tree, no gateway). The compact
-`POST /ALL` of the plain REST interface needs 1 request instead of 2–3 and is
-the fastest HTTP variant; the wdx data layer is self-describing and
-standard-shaped (same tree for SCADA, scripts and CODESYS).
+KBus directly (KBus in the device tree, no gateway). Since gateway 2.0.0 the
+wdx data layer is the only interface: self-describing and standard-shaped,
+the same tree for CODESYS, SCADA and scripts.
 
 `tLastExchange` shows the real duration; compare it with the expected
 2–3 × (3–5 task cycles).

@@ -1,151 +1,244 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>KBUS Gateway</title>
+<!--
+  Web page of the KBUS gateway, served at http://<pfc-ip>:8000/ .
+  Built into the program (src/web_asset.S). Uses ONLY the wdx data layer:
+    - once:  GET /wda/parameters                          (tree: modules, channels)
+    - live:  GET /wda/parameters?filter[id]=...           (status + all value arrays, one request)
+    - write: PATCH /wda/parameters/0-0-kbus-...-value     (JSON:API body)
+  No external files: works on a machine network without internet.
+-->
 <style>
-:root{--bg:#f4f6f8;--card:#fff;--fg:#1d2329;--muted:#66717c;--line:#dde2e7;--accent:#6ec800;--accent-fg:#0d2600;--off:#c9d0d6;--err:#d0342c}
-@media (prefers-color-scheme:dark){:root{--bg:#14181c;--card:#1e2328;--fg:#e8ecef;--muted:#98a3ad;--line:#323a42;--off:#3c454e;--accent-fg:#0d2600}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
-header{display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;align-items:center;padding:1rem 16px;border-bottom:1px solid var(--line);background:var(--card)}
-h1{font-size:1.15rem;margin:0}
-.stat{color:var(--muted);font-size:.85rem}.stat b{color:var(--fg);font-weight:600}
-.badge{padding:.1rem .55rem;border-radius:99px;font-size:.8rem;font-weight:600;background:var(--accent);color:var(--accent-fg)}
-.badge.bad{background:var(--err);color:#fff}.badge.sim{background:#f0b400;color:#2b2000}
-main{max-width:1200px;margin:0 auto;padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
-section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
-h2{font-size:1rem;margin:0 0 .6rem;display:flex;justify-content:space-between}
-h2 span{color:var(--muted);font-weight:400;font-size:.85rem}
-.row{display:flex;align-items:center;gap:.6rem;padding:.3rem 0;border-top:1px solid var(--line)}
-.row:first-of-type{border-top:0}
-.row a{color:var(--fg);text-decoration:none;font-family:ui-monospace,monospace;min-width:4.2rem}
-.row a:hover{text-decoration:underline}
-.meta{color:var(--muted);font-size:.78rem;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.led{width:14px;height:14px;border-radius:50%;background:var(--off);flex:none}
-.led.on{background:var(--accent);box-shadow:0 0 6px var(--accent)}
-.val{font-family:ui-monospace,monospace;min-width:4.5rem;text-align:right}
-button{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;padding:.2rem .7rem;cursor:pointer}
-button.on{background:var(--accent);color:var(--accent-fg);border-color:transparent}
-input{font:inherit;width:6rem;padding:.15rem .35rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
-.empty{color:var(--muted);font-size:.9rem}
-#modules{grid-column:1/-1;overflow-x:auto}
-table{border-collapse:collapse;width:100%;font-size:.88rem}
-th,td{text-align:left;padding:.3rem .5rem;border-top:1px solid var(--line);white-space:nowrap}
-th{color:var(--muted);font-weight:500;border-top:0}
-#msg{color:var(--err);font-size:.85rem}
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --ink: #1f2837; --muted: #6b7280; --line: #dde1e7;
+    --on: #6ec800; --on-ink: #1f2837; --off: #e6e9ee; --accent: #0b5d8f; --bad: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14181f; --card: #1d232c; --ink: #e8ecf1; --muted: #9aa4b2; --line: #2d3540;
+            --off: #2a313b; --accent: #5fb3e6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  header { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center;
+           padding: 14px 20px; background: var(--card); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  .stat { color: var(--muted); font-size: 13px; }
+  .stat b { color: var(--ink); font-weight: 600; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+         background: var(--muted); margin-right: 6px; vertical-align: -1px; }
+  .dot.ok { background: var(--on); } .dot.bad { background: var(--bad); }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px 20px 40px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 14px 16px; margin-bottom: 14px; }
+  section h2 { font-size: 14px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .06em;
+               color: var(--muted); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; }
+  .ch { border: 1px solid var(--line); border-radius: 8px; padding: 8px 6px; text-align: center;
+        background: var(--off); font-size: 13px; user-select: none; }
+  .ch .n { font-weight: 650; }
+  .ch .v { font-size: 12px; color: var(--muted); }
+  .ch.on { background: var(--on); color: var(--on-ink); border-color: transparent; }
+  .ch.on .v { color: var(--on-ink); }
+  button.ch { cursor: pointer; font: inherit; color: inherit; width: 100%; }
+  button.ch:hover { outline: 2px solid var(--accent); }
+  button.ch:disabled { cursor: default; opacity: .6; outline: none; }
+  .ana { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+  .ana .ch { text-align: left; background: var(--card); padding: 8px 10px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--off); margin-top: 6px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .ao { display: flex; gap: 6px; margin-top: 6px; }
+  .ao input { width: 100%; min-width: 0; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+              background: var(--bg); color: var(--ink); font: inherit; }
+  .ao button { padding: 4px 10px; border: 0; border-radius: 6px; background: var(--accent); color: #fff;
+               font: inherit; cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  .note { font-size: 13px; color: var(--muted); }
+  #msg { min-height: 1.4em; font-size: 13px; }
+  #msg.err { color: var(--bad); }
+  code { font-size: 12px; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
 <header>
   <h1>KBUS Gateway</h1>
-  <span id="badge" class="badge">…</span>
-  <span class="stat">cycles <b id="cycles">-</b></span>
-  <span class="stat">cycle <b id="cycle">-</b></span>
-  <span class="stat">errors <b id="errors">-</b></span>
-  <span id="msg"></span>
+  <span class="stat"><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
+  <span class="stat">KBUS <b id="healthy">–</b></span>
+  <span class="stat">cycle <b id="cycletime">–</b> ms</span>
+  <span class="stat">cycles <b id="cycles">–</b></span>
+  <span class="stat">errors <b id="errors">–</b></span>
 </header>
 <main>
-  <section><h2>Digital inputs <span id="n-DI"></span></h2><div id="DI"></div></section>
-  <section><h2>Digital outputs <span id="n-DO"></span></h2><div id="DO"></div></section>
-  <section><h2>Analog inputs <span id="n-AI"></span></h2><div id="AI"></div></section>
-  <section><h2>Analog outputs <span id="n-AO"></span></h2><div id="AO"></div></section>
-  <section id="modules"><h2>Modules</h2><table><thead><tr><th>Pos</th><th>Type</th><th>In bits</th><th>Out bits</th><th>Channels</th></tr></thead><tbody id="mods"></tbody></table></section>
+  <div id="msg"></div>
+  <section id="sec-di" class="hidden"><h2>Digital inputs</h2><div id="di" class="grid"></div></section>
+  <section id="sec-do" class="hidden"><h2>Digital outputs <span class="note">(click to switch)</span></h2><div id="do" class="grid"></div></section>
+  <section id="sec-ai" class="hidden"><h2>Analog inputs <span class="note">(raw 0–65535)</span></h2><div id="ai" class="ana"></div></section>
+  <section id="sec-ao" class="hidden"><h2>Analog outputs <span class="note">(raw 0–65535)</span></h2><div id="ao" class="ana"></div></section>
+  <section><h2>Modules</h2><table><thead><tr><th>#</th><th>Module</th><th>Type code</th><th>Channels</th></tr></thead><tbody id="mods"></tbody></table></section>
+  <p class="note">
+    Live values through the wdx data layer: one <code>GET /wda/parameters?filter[id]=…</code> every
+    <span id="poll">500</span> ms; switching uses <code>PATCH /wda/parameters/{id}</code>.
+    If another client (for example a CODESYS application) writes the outputs, it overrides changes made here.
+    All parameters: <a href="/wda/parameters">/wda/parameters</a>.
+  </p>
 </main>
 <script>
-const KINDS = ['DI', 'DO', 'AI', 'AO'];
-const shape = {};          // channel count per kind, to know when to rebuild
-let token = '';
+"use strict";
+const P = "/wda/parameters";
+const POLL_MS = 500;
+const CLASSES = [
+  { key: "di", ids: "0-0-kbus-digitalinputvalues",  name: "DI", digital: true,  write: false },
+  { key: "do", ids: "0-0-kbus-digitaloutputvalues", name: "DO", digital: true,  write: true,  chan: "digitaloutputs" },
+  { key: "ai", ids: "0-0-kbus-analoginputvalues",   name: "AI", digital: false, write: false },
+  { key: "ao", ids: "0-0-kbus-analogoutputvalues",  name: "AO", digital: false, write: true,  chan: "analogoutputs" },
+];
 const $ = id => document.getElementById(id);
-const msg = t => { $('msg').textContent = t || ''; };
+let busy = false;           // the gateway serves one client at a time: never overlap requests
+let failures = 0;
 
-async function write(path, value) {
-  const headers = { 'Content-Type': 'text/plain' };
-  if (token) headers.Authorization = 'Bearer ' + token;
-  const r = await fetch(path, { method: 'POST', headers, body: String(value) });
-  if (r.status === 401) {
-    token = prompt('API token required for writing') || '';
-    if (token) return write(path, value);
+function msg(text, err) { const m = $("msg"); m.textContent = text || ""; m.className = err ? "err" : ""; }
+
+async function wda(method, path, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) {
+    opt.headers["Content-Type"] = "application/vnd.api+json";
+    opt.body = JSON.stringify(body);
   }
-  if (!r.ok) throw new Error(await r.text());
-  msg('');
+  const r = await fetch(path, opt);
+  const text = await r.text();
+  const json = text ? JSON.parse(text) : null;
+  if (!r.ok) {
+    const e = json && json.errors && json.errors[0];
+    throw new Error(`${r.status} ${e ? e.title + ": " + e.detail : r.statusText}`);
+  }
+  return json;
 }
 
-function build(kind, list) {
-  const box = $(kind);
-  box.replaceChildren();
-  $('n-' + kind).textContent = list.length ? list.length + ' ch' : '';
-  if (!list.length) { box.innerHTML = '<div class="empty">none</div>'; return; }
-  for (const c of list) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = `<a href="${c.path}" title="open ${c.path}">${c.path.slice(1)}</a>` +
-      `<span class="meta">pos ${c.module} · ${c.moduleType} · ch ${c.moduleChannel}</span>`;
-    if (kind === 'DI') {
-      row.append(Object.assign(document.createElement('span'), { className: 'led' }));
-    } else if (kind === 'DO') {
-      const b = document.createElement('button');
-      b.onclick = () => write(c.path, b.classList.contains('on') ? 0 : 1).then(poll).catch(e => msg(e.message));
-      row.append(b);
-    } else if (kind === 'AI') {
-      row.append(Object.assign(document.createElement('span'), { className: 'val' }));
-    } else {
-      const i = Object.assign(document.createElement('input'), { type: 'number', step: 1 });
-      const b = Object.assign(document.createElement('button'), { textContent: 'Set' });
-      const send = () => write(c.path, i.value).then(() => { i.blur(); poll(); }).catch(e => msg(e.message));
-      b.onclick = send;
-      i.onkeydown = e => { if (e.key === 'Enter') send(); };
-      row.append(i, b);
+function byId(list) { const m = {}; for (const p of list) m[p.id] = p.attributes.value; return m; }
+
+// ---------------------------------------------------------------- build the page once
+async function init() {
+  const all = byId((await wda("GET", P)).data);
+  const nmod = (all["0-0-kbus-modules"] || []).length;
+  $("mods").innerHTML = "";
+  for (let m = 1; m <= nmod; m++) {
+    const tr = document.createElement("tr");
+    for (const v of [m, all[`0-0-kbus-modules-${m}-name`], all[`0-0-kbus-modules-${m}-typecode`],
+                     all[`0-0-kbus-modules-${m}-channelcount`]]) {
+      const td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
     }
-    box.append(row);
+    $("mods").appendChild(tr);
   }
+  if (!nmod) $("mods").innerHTML = '<tr><td colspan="4">no modules</td></tr>';
+  for (const c of CLASSES) {
+    const n = (all[c.ids] || []).length;
+    c.count = n;
+    $("sec-" + c.key).classList.toggle("hidden", n === 0);
+    const box = $(c.key);
+    box.innerHTML = "";
+    for (let i = 1; i <= n; i++) {
+      let el;
+      if (c.digital) {
+        el = document.createElement(c.write ? "button" : "div");
+        el.className = "ch";
+        el.innerHTML = `<div class="n">${c.name}${i}</div><div class="v">–</div>`;
+        if (c.write) el.onclick = () => setDigital(i, !el.classList.contains("on"), el);
+      } else {
+        el = document.createElement("div");
+        el.className = "ch";
+        el.innerHTML = `<div><span class="n">${c.name}${i}</span> <span class="v">–</span></div>` +
+                       `<div class="bar"><i style="width:0"></i></div>` +
+                       (c.write ? `<div class="ao"><input type="number" min="0" max="65535" step="1" aria-label="${c.name}${i}">` +
+                                  `<button type="button">Set</button></div>` : "");
+        if (c.write) {
+          const inp = el.querySelector("input");
+          el.querySelector("button").onclick = () => setAnalog(i, inp.value);
+          inp.onkeydown = e => { if (e.key === "Enter") setAnalog(i, inp.value); };
+        }
+      }
+      box.appendChild(el);
+    }
+  }
+  $("cycletime").textContent = all["0-0-kbus-cycletime"];
 }
 
-function update(kind, list) {
-  const rows = $(kind).querySelectorAll('.row');
-  list.forEach((c, n) => {
-    const row = rows[n];
-    if (!row) return;
-    if (kind === 'DI') row.querySelector('.led').classList.toggle('on', c.value === 1);
-    else if (kind === 'DO') {
-      const b = row.querySelector('button');
-      b.classList.toggle('on', c.value === 1);
-      b.textContent = c.value === 1 ? 'ON' : 'OFF';
-    } else if (kind === 'AI') row.querySelector('.val').textContent = c.value;
-    else {
-      const i = row.querySelector('input');
-      if (document.activeElement !== i) i.value = c.value;
+// ---------------------------------------------------------------- live values
+function show(values) {
+  const h = values["0-0-kbus-healthy"];
+  $("healthy").textContent = h ? "running" : "ERROR";
+  $("cycles").textContent = values["0-0-kbus-cyclecount"];
+  $("errors").textContent = values["0-0-kbus-errorcount"];
+  for (const c of CLASSES) {
+    const vals = values[c.ids] || [];
+    const els = $(c.key).children;
+    for (let i = 0; i < vals.length && i < els.length; i++) {
+      const el = els[i], v = vals[i];
+      if (c.digital) {
+        el.classList.toggle("on", v === true);
+        el.querySelector(".v").textContent = v ? "TRUE" : "FALSE";
+      } else {
+        el.querySelector(".v").textContent = v;
+        el.querySelector(".bar i").style.width = (v / 655.35).toFixed(1) + "%";
+        const inp = el.querySelector("input");
+        if (inp && document.activeElement !== inp && inp.value === "") inp.placeholder = v;
+      }
     }
-  });
+  }
 }
 
 async function poll() {
-  try {
-    const [io, st] = await Promise.all([fetch('/api/io').then(r => r.json()),
-                                        fetch('/api/status').then(r => r.json())]);
-    for (const k of KINDS) {
-      if (shape[k] !== io[k].length) { build(k, io[k]); shape[k] = io[k].length; }
-      update(k, io[k]);
+  if (!busy) {
+    busy = true;
+    try {
+      const ids = ["0-0-kbus-healthy", "0-0-kbus-cyclecount", "0-0-kbus-errorcount"]
+        .concat(CLASSES.filter(c => c.count).map(c => c.ids));
+      show(byId((await wda("GET", `${P}?filter[id]=${ids.join(",")}`)).data));
+      failures = 0;
+      $("dot").className = "dot ok"; $("conn").textContent = "online";
+    } catch (e) {
+      if (++failures >= 3) { $("dot").className = "dot bad"; $("conn").textContent = "offline"; }
+    } finally {
+      busy = false;
     }
-    const badge = $('badge');
-    badge.textContent = st.backend === 'simulation' ? 'SIMULATION' : (st.healthy ? 'KBUS running' : 'KBUS error');
-    badge.className = 'badge' + (st.backend === 'simulation' ? ' sim' : st.healthy ? '' : ' bad');
-    $('cycles').textContent = st.cycles;
-    $('cycle').textContent = `${st.cycleMs} ms (${st.lastCycleUs} µs)`;
-    $('errors').textContent = st.errors;
+  }
+  setTimeout(poll, POLL_MS);
+}
+
+// ---------------------------------------------------------------- writes (PATCH)
+async function patch(id, value) {
+  // wait for a running poll: the gateway serves one connection at a time
+  for (let t = 0; busy && t < 50; t++) await new Promise(r => setTimeout(r, 20));
+  busy = true;
+  try {
+    await wda("PATCH", `${P}/${id}`, { data: { type: "parameters", id, attributes: { value } } });
+    msg("");
   } catch (e) {
-    $('badge').textContent = 'offline';
-    $('badge').className = 'badge bad';
+    msg(`Write ${id} failed: ${e.message}`, true);
+  } finally {
+    busy = false;
   }
 }
 
-fetch('/api/modules').then(r => r.json()).then(mods => {
-  $('mods').innerHTML = mods.map(m =>
-    `<tr><td>${m.position}</td><td>${m.type}</td><td>${m.inBits}</td><td>${m.outBits}</td><td>${m.channels}</td></tr>`).join('');
-});
-poll();
-setInterval(poll, 500);
+function setDigital(n, value, el) {
+  el.classList.toggle("on", value);            // immediate feedback; the next poll confirms
+  patch(`0-0-kbus-digitaloutputs-${n}-value`, value);
+}
+
+function setAnalog(n, text) {
+  const v = Number(text);
+  if (!Number.isInteger(v) || v < 0 || v > 65535) { msg(`AO${n}: enter an integer 0…65535`, true); return; }
+  patch(`0-0-kbus-analogoutputs-${n}-value`, v);
+}
+
+$("poll").textContent = POLL_MS;
+init().then(poll).catch(e => { msg("Cannot read /wda/parameters: " + e.message, true); setTimeout(() => location.reload(), 5000); });
 </script>
 </body>
 </html>

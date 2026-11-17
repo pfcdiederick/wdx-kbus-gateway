@@ -2,35 +2,35 @@
 
 A small native application for WAGO PFC100 / PFC200 / **PFC300** controllers
 that reads and writes the channels of the **DI / DO / AI / AO** modules on the
-KBUS and makes them available over HTTP. It is installed as a normal firmware
-package (`.ipk`) on the PTXdist firmware, starts at boot and runs the KBUS
-cycle with real-time priority. No Docker is needed on the controller.
+KBUS and presents them as a **wdx data layer** over HTTP. It is installed as a
+normal firmware package (`.ipk`) on the PTXdist firmware, starts at boot and
+runs the KBUS cycle with real-time priority. No Docker is needed on the
+controller.
 
-Three ways to reach the same KBUS data, all on port 8000:
+The wdx data layer is the **only interface** (port 8000). It follows the WAGO
+wdx / WDA conventions: paths, ids, data types, GET reads, PATCH writes,
+JSON:API.
 
 ```
-GET   http://<pfc-ip>:8000/DI/1                       -> DI1=TRUE         single channel
-POST  http://<pfc-ip>:8000/DO/3   body TRUE           -> DO3=TRUE         switch one output
-GET   http://<pfc-ip>:8000/ALL                        -> DI=0110;DO=00100000;AI=16384;AO=0
-POST  http://<pfc-ip>:8000/ALL    body DO=00100001    -> write all outputs, read everything
-GET   http://<pfc-ip>:8000/wda/parameters/0-0-kbus-digitaloutputs-3-value   (wdx data layer, JSON:API)
+GET   http://<pfc-ip>:8000/wda/parameters                                   all parameters
+GET   http://<pfc-ip>:8000/wda/parameters/0-0-kbus-digitalinputs-1-value    one input
+GET   http://<pfc-ip>:8000/wda/parameters?filter[id]=0-0-kbus-digitalinputvalues,0-0-kbus-analoginputvalues
+PATCH http://<pfc-ip>:8000/wda/parameters/0-0-kbus-digitaloutputs-3-value   {"data":{...,"attributes":{"value":true}}}
 ```
 
-- **Single channels** behave exactly like the CODESYS application *REST I/O
-  server on PFC200* (reference behaviour 1.0, 11-11-2026): same requests, same
-  response bytes.
-- **Bulk requests** exchange all channels in one request.
-- The **wdx data layer** presents the KBUS as parameters following the WAGO
-  wdx / WDA conventions (paths, ids, data types, GET/PATCH, JSON:API). A
-  CODESYS application that reads and controls the KBUS through it is in
-  [codesys-wdx/](codesys-wdx/README.md).
+**Web page:** open `http://<pfc-ip>:8000/` in a browser for a live view of all
+inputs and outputs, with buttons to switch the outputs (3.5). The page itself
+uses only the wdx data layer.
+
+A CODESYS application that reads and controls the KBUS through the data layer
+is in [codesys-wdx/](codesys-wdx/README.md).
 
 The KBUS access is based on the WAGO example *HowTo_ADI-MyKBusApplikation* in
 [`Information/`](Information/HowTo_ADI-MyKBusApplikation/README.md) (same ADI/DAL
 calls as `kbusdemo.c`, same module discovery as `getkbusinfo.c`).
 
-Tested on a **PFC300 750-8302, firmware 04.08.09(30)**: version 1.1.3, real KBUS
-with one 8DO module, used by a CODESYS application at the same time.
+Tested on a **PFC300 750-8302, firmware 04.08.09(30)** with a real KBUS (one
+8DO module), used by a CODESYS application at the same time.
 
 ---
 
@@ -38,7 +38,7 @@ with one 8DO module, used by a CODESYS application at the same time.
 
 1. [How it works](#1-how-it-works)
 2. [Installation](#2-installation)
-3. [Using the gateway](#3-using-the-gateway)
+3. [Using the gateway: the wdx data layer](#3-using-the-gateway-the-wdx-data-layer)
 4. [Configuration](#4-configuration)
 5. [Speed and determinism](#5-speed-and-determinism)
 6. [How it was built](#6-how-it-was-built)
@@ -54,9 +54,9 @@ with one 8DO module, used by a CODESYS application at the same time.
  CODESYS / browser / SCADA / script                     WAGO PFC (PTXdist firmware)
  ──────────────────────────────────          ┌───────────────────────────────────────────────┐
                                              │ /usr/bin/kbus-gateway  (started by init.d)    │
-  GET  /DI/1                ─────────────────┼─▶ REST server thread  (port 8000)             │
-  POST /ALL   DO=0100...                     │     single channels · bulk /ALL · wdx /wda    │
-  PATCH /wda/parameters/...                  │        │ read / write (mutex)                 │
+  GET   /wda/parameters/...  ────────────────┼─▶ HTTP server thread  (port 8000)             │
+  PATCH /wda/parameters/...                  │     wdx data layer (JSON:API)                 │
+                                             │        │ read / write (mutex)                 │
                                              │        ▼                                      │
                                              │   channel map + process images in memory     │
                                              │        ▲                                      │
@@ -80,7 +80,7 @@ with one 8DO module, used by a CODESYS application at the same time.
    *Unconfigured*. The modules are read through the KBUS-info D-Bus
    interface, as in `getkbusinfo.c`: position, type, bit offsets and sizes,
    and number of channels.
-3. A **channel map** is built, as in the CODESYS reference. Channels are
+3. A **channel map** is built. Channels are
    numbered from 1, separately for each type, in module order from left to
    right. At most 250 modules and 250 channels per type.
    - **Digital module** (type code bit 15 set): every input bit is a `DI` and
@@ -95,22 +95,23 @@ with one 8DO module, used by a CODESYS application at the same time.
      interfaces) get no channels; their outputs stay 0.
 4. The KBUS is switched to application state *Running*. From then on the
    gateway drives every bus cycle itself, as in `kbusdemo.c`.
-5. The REST server starts (optionally with real-time priority, see
-   `HTTP_PRIORITY`) and builds the parameter table of the wdx data layer once.
+5. The HTTP server starts (optionally with real-time priority, see
+   `HTTP_PRIORITY`) and builds the parameter table of the wdx data layer once
+   (ids precomputed, so every lookup is cheap).
 
 **KBUS cycle thread.** Every `KBUS_CYCLE_MS` (default 10 ms) a real-time
 thread (`SCHED_FIFO`, priority 40) copies the output image, triggers one cycle
 with `libpackbus_Push` and stores the input image. WAGO output modules switch
 their outputs off when no cycle arrives within **50 ms**, so this thread never
-waits for the REST server: the shared images are locked only for the copy,
+waits for the HTTP server: the shared images are locked only for the copy,
 not during the bus cycle.
 
 **HTTP requests** only touch the in-memory process images:
 
 - Reading an input returns the value of the last bus cycle.
 - Writing an output changes the output image; the next cycle (≤ 10 ms later)
-  sends it to the module. All values of one bulk or array write are applied
-  under one lock, so they reach the modules in the same cycle.
+  sends it to the module. All values of one array write are applied under one
+  lock, so they reach the modules in the same cycle.
 - Reading an output returns the value that was last commanded.
 
 **Shutdown.** `/etc/init.d/kbus-gateway stop` (also at shutdown) sends
@@ -205,7 +206,7 @@ headers have no architecture-specific parts: the PFC300 SDK headers (`dal
 1.0.1`) also fit a PFC200 with FW31 (`libdal.so.1.0.1`).
 
 Without `sdk/include/dal` only the **simulation** build works (`make`), which
-is enough to develop and test the HTTP interfaces (7.2).
+is enough to develop and test the wdx data layer (7.2).
 
 ### 2.4 Build the package
 
@@ -272,16 +273,15 @@ kbus-gateway[21566]: application state set to 'Running'
 kbus-gateway[21566]: module  1: digital 8DO    in   0 bits @0     out   8 bits @0
 kbus-gateway[21566]: channels: 0 DI, 8 DO, 0 AI, 0 AO; 0 x 750-495
 kbus-gateway[21566]: KBUS cycle thread running: SCHED_FIFO priority 40, every 10 ms
-kbus-gateway[21566]: REST server thread: SCHED_FIFO priority 30
-kbus-gateway[21566]: REST server listening on port 8000 (e.g. GET /DI/1, bulk GET /ALL)
+kbus-gateway[21566]: HTTP server thread: SCHED_FIFO priority 30
+kbus-gateway[21566]: wdx data layer listening on port 8000 (GET /wda/parameters)
 ```
 
 ### 2.7 Test
 
 ```bash
-tools/test-rest.py 192.168.1.17 node              # real node, READ ONLY: channel counts, reads, invalid requests
+tools/test-rest.py 192.168.1.17 node              # real node, READ ONLY: parameter tree, values, invalid requests
 tools/test-rest.py 192.168.1.17 write --do 1      # real node: switches DO1 on/off with pauses (check what is connected!)
-curl http://192.168.1.17:8000/ALL                 # DI=;DO=00000000;AI=;AO=
 curl -g "http://192.168.1.17:8000/wda/parameters?page[limit]=5"
 ```
 
@@ -289,93 +289,11 @@ Simulation tests (all writes allowed) are in 7.2.
 
 ---
 
-## 3. Using the gateway
+## 3. Using the gateway: the wdx data layer
 
-### 3.1 Single channels (CODESYS reference behaviour)
+### 3.1 Parameters
 
-| Request | Condition | Response body (status 200) |
-|---|---|---|
-| `GET /DI/n` | n ≤ number of DI | `DIn=TRUE` or `DIn=FALSE` |
-| `GET /DO/n` | n ≤ number of DO | `DOn=TRUE` or `DOn=FALSE`: the value last written |
-| `GET /AI/n` | n ≤ number of AI | `AIn=<raw value>`, unsigned 0–65535 |
-| `GET /AO/n` | n ≤ number of AO | `AOn=<value>`: the value last written |
-| `POST /DO/n` | body `1`, `TRUE`, `0` or `FALSE` | `DOn=TRUE` / `DOn=FALSE` (new value) |
-| `POST /AO/n` | body: decimal digits, 0–65535 | `AOn=<value>` (new value) |
-
-```bash
-curl http://192.168.1.17:8000/DI/1                 # DI1=TRUE
-curl -X POST -d TRUE  http://192.168.1.17:8000/DO/1 # DO1=TRUE
-curl -X POST -d 16384 http://192.168.1.17:8000/AO/1 # AO1=16384
-```
-
-Rules (identical to the CODESYS reference):
-
-- Everything is **case-sensitive**: method `GET`/`POST`, `DI`/`DO`/`AI`/`AO`,
-  `TRUE`/`FALSE`.
-- The channel number is decimal digits only, greater than 0. Leading zeros
-  are accepted (`/DO/01` is channel 1); the response writes it without them.
-  A trailing slash, a query string or any other character gives 404.
-- Headers are not evaluated (`Content-Length` and `Content-Type` have no
-  effect) and the HTTP version is not checked.
-- The POST body starts after the first empty line and ends at the first CR or
-  LF. Nothing else is accepted: no lowercase, sign, decimal point, hex or
-  spaces. An invalid body leaves the output unchanged.
-- Values are **raw process-image values**, as in CODESYS. For example, for a
-  750-559 (0–10 V), 0x7FFF = 10 V. Scale them in your application.
-
-Responses: a status line, two headers, an empty line and a one-line body
-without a line ending. There is no `Content-Length`; the server closes the
-connection.
-
-```
-HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDO1=TRUE
-```
-
-| Status | Body | When |
-|---|---|---|
-| 200 OK | see above | valid request |
-| 403 Forbidden | `Output writes are disabled` | `POST /DO/n` or `/AO/n` while `HTTP_WRITE_ENABLE=0` (checked before the channel count) |
-| 404 Not Found | `Unknown endpoint, channel, or value` | everything else |
-
-### 3.2 Bulk requests (all channels in one request)
-
-An extension that is not in the CODESYS reference. Every request costs one
-TCP connection, and in a PLC every connection takes several task cycles, so
-exchanging all channels in **one** request is much faster than one request
-per channel. For the gateway a bulk request costs about the same as a single
-channel.
-
-| Request | Body | Answer body (status 200) |
-|---|---|---|
-| `GET /DI`, `GET /DO` | – | `DI=0110...`: one char per channel, `0`/`1`, channel 1 first |
-| `GET /AI`, `GET /AO` | – | `AI=0,16384,...`: decimal raw values, comma separated |
-| `GET /ALL` | – | `DI=...;DO=...;AI=...;AO=...` (a class without channels gives e.g. `AI=`) |
-| `POST /DO` | `0110-1`: `0`/`1` per channel from channel 1, `-` = leave unchanged | `DO=...` (all DO after the write) |
-| `POST /AO` | `0,16384,-`: values from channel 1, `-` = leave unchanged | `AO=...` |
-| `POST /ALL` | `DO=...;AO=...` (each part optional, any order) | as `GET /ALL`, after the write |
-
-```bash
-curl http://192.168.1.17:8000/ALL                                   # DI=;DO=00000001;AI=;AO=
-curl -X POST -d 10000001 http://192.168.1.17:8000/DO                # DO1 and DO8 on, rest off
-curl -X POST -d 'DO=1-------' http://192.168.1.17:8000/ALL          # only DO1 on
-```
-
-- A body may hold **fewer** values than there are channels (the rest stays
-  unchanged), never more: that gives 404.
-- Bulk writes are **checked completely first and then applied under one
-  lock**; if one value is invalid, **nothing** is written (404).
-- Otherwise the rules of 3.1 apply. Bulk requests may be up to 4096 bytes;
-  single-channel requests are still decoded from the first 512 bytes only.
-- The paths without a channel number gave 404 in the reference, so the
-  extension changes nothing for clients of the reference behaviour.
-
-A CODESYS client for `POST /ALL` (one request per exchange) is in
-[docker-codesys3-wagopfc](https://github.com/pfcdiederick/docker-codesys3-wagopfc)
-(`codesys/`).
-
-### 3.3 wdx data layer (`/wda/parameters`)
-
-All KBUS data is also presented as **parameters following the WAGO wdx / WDA
+All KBUS data is presented as **parameters following the WAGO wdx / WDA
 conventions** (see the training in `Information/WDX/`): one flat list,
 JSON:API 1.0, **GET reads, PATCH writes one parameter**.
 
@@ -410,6 +328,12 @@ KBus/AnalogInputValues            uint16[]  R
 KBus/AnalogOutputValues           uint16[]  R/W
 ```
 
+Channels are numbered per class from 1, in KBUS order (left to right). Values
+are **raw process-image values**: for a 750-559 (0–10 V), 32767 = 10 V. Scale
+them in your application.
+
+### 3.2 Requests
+
 | Request | Answer |
 |---|---|
 | `GET /wda/parameters` | all parameters (`page[limit]`, `page[offset]`) |
@@ -429,11 +353,14 @@ curl -X PATCH -H 'Content-Type: application/vnd.api+json' \
 ```
 
 A PATCH body is a JSON:API document whose `type` (`parameters`) and `id` must
-match the URL. Every answer carries `Content-Length`. Status codes: `200`,
+match the URL. Values: `true`/`false` for DO, integers 0–65535 for AO; an
+array may hold fewer values than channels (the rest stays), never more. A
+rejected PATCH writes **nothing**. Every answer carries `Content-Length`. Status codes: `200`,
 `204`, `400` malformed body / type or id mismatch, `403` writes disabled,
 `404` unknown id, `405` wrong method, `409` read-only, value out of range or
 too many values, `415` Content-Type is not `application/vnd.api+json`. Errors
-carry a JSON:API `errors` body.
+carry a JSON:API `errors` body. Any other path or method (for example the
+`/DO/1` and `/ALL` requests of version 1.x) gets `404` or `405`.
 
 Differences from the firmware's own WDA (`https://<pfc>/wda`): plain HTTP on
 port 8000, no TLS, no authentication, only the KBUS parameters.
@@ -441,19 +368,20 @@ port 8000, no TLS, no authentication, only the KBUS parameters.
 **CODESYS application through the wdx data layer:** [codesys-wdx/README.md](codesys-wdx/README.md),
 with ST code and a ready-to-paste brief for Claude in CODESYS.
 
-### 3.4 Connection handling (all interfaces)
+### 3.3 Connection handling
 
-- **One client at a time.** The server reads **once** per connection and
-  decodes only those bytes. If headers and body arrive in separate TCP
-  segments, the body is missing. Send each request in one write (curl and
-  the CODESYS function blocks do this).
+- **One client at a time.** A request may be at most 4096 bytes. When the
+  body arrives in a separate TCP segment (browsers do this), the server waits
+  up to **100 ms** for the number of bytes that `Content-Length` announces;
+  a body that comes later is missing (400). Clients that send each request in
+  one write (curl, the CODESYS function blocks) never wait.
 - **One request per connection**; the server closes it after the answer.
 - There is no time-out: a client that connects and sends nothing blocks the
   server until it disconnects. Clients must close on their own time-out.
 - An output keeps its value until it is written again; there is no client
   monitoring. After a start all outputs are `FALSE` / 0.
 
-### 3.5 Live log
+### 3.4 Live log
 
 ```bash
 ssh root@192.168.1.17 'tail -f /var/log/messages | grep kbus-gateway'
@@ -462,12 +390,38 @@ ssh root@192.168.1.17 'tail -f /var/log/messages | grep kbus-gateway'
 | `HTTP_LOG` | Logged |
 |---|---|
 | `0` | no requests |
-| `1` (default) | writes that **change** an output: `write DO3 = 1`, `write DO=10000001`, `write KBus/DigitalOutputValues = [true,...]` |
-| `2` | **every request**: client, request line, status, answer, e.g. `127.0.0.1 "POST /ALL HTTP/1.0" -> 200 DI=;DO=10000000;AI=;AO=` |
+| `1` (default) | writes that **change** an output: `write KBus/DigitalOutputs/3/Value = true`, `write KBus/DigitalOutputValues = [true,false,...]` |
+| `2` | **every request**: client, request line, status, start of the answer, e.g. `127.0.0.1 "PATCH /wda/parameters/0-0-kbus-digitaloutputvalues HTTP/1.0" -> 204` |
 
 Level 2 is for testing a client: a CODESYS application that exchanges every
-50 ms writes 20 lines per second. Set it in `/etc/kbus-gateway.conf` and run
+50 ms writes 40 lines per second (PATCH + GET). Set it in `/etc/kbus-gateway.conf` and run
 `/etc/init.d/kbus-gateway restart`.
+
+---
+
+### 3.5 Web page
+
+`http://192.168.1.17:8000/` (also `/index.html`) shows a live view of the
+node, built into the program (no external files, works without internet):
+
+- header: online/offline, KBUS running/error, cycle time, cycle count, errors
+- digital inputs as lamps, digital outputs as buttons (click to switch)
+- analog inputs and outputs with raw value and bar; analog outputs with an
+  input field and *Set*
+- the module list
+
+The page uses only the wdx data layer: one `GET /wda/parameters` at load, then
+one `GET /wda/parameters?filter[id]=…` every 500 ms for the status and all
+value arrays, and `PATCH /wda/parameters/0-0-kbus-…-value` for a click. It
+never runs two requests at the same time. A write that the gateway rejects
+(for example 403 with `HTTP_WRITE_ENABLE=0`) is shown in red at the top.
+
+If another client writes the outputs cyclically (for example a CODESYS
+application), it overrides clicks made on the page within one exchange.
+
+Source: [web/index.html](web/index.html), embedded with `.incbin` by
+[src/web_asset.S](src/web_asset.S). After editing the page, rebuild and
+reinstall the package.
 
 ---
 
@@ -478,11 +432,11 @@ apply with `/etc/init.d/kbus-gateway restart`):
 
 | Variable | Default (program) | Package file | Description |
 |---|---|---|---|
-| `HTTP_PORT` | `8000` | `8000` | port of all interfaces. Not 80/443: the WBM uses them |
-| `HTTP_ENABLE` | `1` | `1` | `0` = REST server off |
-| `HTTP_WRITE_ENABLE` | `1` | `1` | `0` = outputs read-only: POST/PATCH answer 403 |
-| `HTTP_LOG` | `1` | `1` | 0 none, 1 writes that change an output, 2 every request (3.5) |
-| `HTTP_PRIORITY` | `0` | `30` | SCHED_FIFO priority of the REST server thread, 0 = normal. Keep it **below** `KBUS_PRIORITY` |
+| `HTTP_PORT` | `8000` | `8000` | port of the wdx data layer. Not 80/443: the WBM uses them |
+| `HTTP_ENABLE` | `1` | `1` | `0` = HTTP server off |
+| `HTTP_WRITE_ENABLE` | `1` | `1` | `0` = outputs read-only: PATCH answers 403 |
+| `HTTP_LOG` | `1` | `1` | 0 none, 1 writes that change an output, 2 every request (3.4) |
+| `HTTP_PRIORITY` | `0` | `30` | SCHED_FIFO priority of the HTTP server thread, 0 = normal. Keep it **below** `KBUS_PRIORITY` |
 | `KBUS_CYCLE_MS` | `10` | `10` | KBUS cycle, 1–40 ms (stay well below the 50 ms output watchdog) |
 | `KBUS_PRIORITY` | `40` | `40` | SCHED_FIFO priority of the KBUS cycle thread, 0 = normal |
 | `LOG_TARGET` | stderr | `syslog` | `syslog` = `/var/log/messages` |
@@ -495,40 +449,41 @@ apply with `/etc/init.d/kbus-gateway restart`):
 
 ## 5. Speed and determinism
 
-Measured on the PFC300 (FW 04.08.09(30), version 1.1.3) with `curl` on the
-controller itself, a new TCP connection per request, 1000 requests, while a
-CODESYS application was running:
+Measured on the PFC300 (FW 04.08.09(30), version 1.1.3, same wdx code as
+2.0.0) with `curl` on the controller itself, a new TCP connection per request,
+while a CODESYS application was running:
 
 | Request | median | p95 | p99 | max |
 |---|---|---|---|---|
-| `GET /ALL` | 1.27 ms | 1.78 ms | 10.4 ms | 11.6 ms |
-| wdx `GET ?filter[id]=...` | 1.35 ms | 1.96 ms | 10.6 ms | 13.0 ms |
-| wdx `GET` one parameter (300×) | 1.15 ms | 1.83 ms | – | 10.7 ms |
-| wdx `PATCH` (300×) | 1.25 ms | 1.92 ms | – | 11.1 ms |
+| `GET ?filter[id]=...` (1000×) | 1.35 ms | 1.96 ms | 10.6 ms | 13.0 ms |
+| `GET` one parameter (300×) | 1.15 ms | 1.83 ms | – | 10.7 ms |
+| `GET` all 40 parameters (300×) | 1.46 ms | 2.18 ms | – | 11.8 ms |
+| `PATCH` (300×, JSON parsed) | 1.25 ms | 1.92 ms | – | 11.1 ms |
 
 On a PC the gateway itself needs < 0.1 ms per request; the rest is TCP
-connect/close on the controller. wdx requests are as fast as `/ALL`.
+connect/close on the controller.
 
 **The outliers of ~10 ms** (about 3 % of the requests) come from the CODESYS
 runtime: it runs its own real-time threads at priorities 50–83 (`Schedule`
 81, `TaskGapTask` 71, `WagoAsyncRtHigh` 53 …), deliberately above everything
-else, including the KBUS cycle (40) and the REST server (30). A real-time
+else, including the KBUS cycle (40) and the HTTP server (30). A real-time
 client (`chrt -f 20 curl`) showed the same outliers. Raising the gateway
 above CODESYS would disturb the PLC program, so it is not done.
-`HTTP_PRIORITY=30` protects the REST server against all non-real-time load
+`HTTP_PRIORITY=30` protects the HTTP server against all non-real-time load
 (WBM, logging, other programs).
 
 For a CODESYS client the exchange time is set by its **task cycles** (each
-request needs a few: connect, write, read), not by the gateway:
-
-| | requests per exchange | measured at MainTask 10 ms |
-|---|---|---|
-| single channels (`/DO/n`) | one per channel | – (≈ 350 ms per channel at 50 ms task) |
-| bulk `POST /ALL` | 1 | ≈ 70 ms per exchange |
-| wdx (`PATCH` arrays + one `GET`) | 2 (3 with AO) | see [codesys-wdx](codesys-wdx/README.md) |
+request needs a few: connect, write, read), not by the gateway. One exchange
+of the CODESYS reference ([codesys-wdx](codesys-wdx/README.md)) is a fixed
+sequence: `PATCH` the DO array (+ the AO array) and one `GET` with
+`filter[id]` for all values, so 2 (3 with AO) requests, independent of the
+number of channels. With version 1.x, one request per channel took 350 ms per
+channel at a 50 ms task; one request for everything took about 70 ms at a
+10 ms task.
 
 Rules for constant timing: MainTask 10 ms, a fixed sequence of requests per
-exchange, arrays or `/ALL` instead of single channels, `HTTP_LOG=1`. HTTP over
+exchange, the array parameters (`...values`) instead of one request per
+channel, `filter[id]` for reading, `HTTP_LOG=1`. HTTP over
 TCP is fast but not hard real-time; for hard real-time I/O let CODESYS drive
 the KBUS directly.
 
@@ -542,10 +497,8 @@ This chapter records how the gateway came about and why it looks like it does.
 
 1. **Reference behaviour.** The starting point was a CODESYS application,
    *REST I/O server on PFC200* (FbREST, version 1.0, 11-11-2026), that serves
-   the KBUS channels as `GET /DI/1` → `DI1=TRUE`. The gateway reproduces it
-   byte for byte; `tools/test-rest.py <host> sim` checks all 31 reference
-   cases and the special cases (512-byte read, split TCP segments, overflow
-   of the channel number, idle client).
+   the KBUS channels as `GET /DI/1` → `DI1=TRUE`. Version 1.x reproduced it
+   byte for byte, checked by 31 reference cases.
 2. **KBUS access** was taken from the WAGO example
    *HowTo_ADI-MyKBusApplikation* (`Information/`, MIT licence): ADI/DAL device
    scan, `libpackbus`, application state *Running*, one `libpackbus_Push` per
@@ -558,7 +511,8 @@ This chapter records how the gateway came about and why it looks like it does.
    the git history before version 1.1.3).
 4. **Bulk requests** (`/ALL`) were added when a CODESYS client with one
    request per channel turned out to be too slow (350 ms per request at a
-   50 ms task; outputs were skipped).
+   50 ms task; outputs were skipped). That showed the principle: one request
+   for all channels.
 5. **wdx data layer.** To present the KBUS data like WAGO's own parameter
    model (training *Communicating with the WAGO CC100 via the wdx Parameter
    Model & WDA REST Interface*), the `/wda/parameters` interface was added
@@ -567,11 +521,17 @@ This chapter records how the gateway came about and why it looks like it does.
 6. **Native package.** To make it easy to install and as fast as possible, the
    gateway became a native `.ipk` for the PTXdist firmware (version 1.1.x),
    and the Docker files were removed.
+7. **wdx only (version 2.0.0).** The single-channel and bulk interfaces were
+   removed: the wdx data layer is the one interface, with its array
+   parameters and `filter[id]` taking over the role of the bulk requests.
+   The code of version 1.x is in the git history. A web page on top of the
+   data layer replaced the old, unused page of the first version; a browser
+   click was verified in headless Chrome (PATCH → 204 → output switched).
 
 ### 6.2 Source structure
 
-The program is plain C (gnu11), about 2600 lines, no dependencies besides
-glibc. Two threads matter: the KBUS cycle thread (`gateway.c`) and the REST
+The program is plain C (gnu11), about 2200 lines, no dependencies besides
+glibc. Two threads matter: the KBUS cycle thread (`gateway.c`) and the HTTP
 server thread (`http_server.c` + `wda.c`). They share only the process images
 and channel values, behind one mutex with priority inheritance.
 
@@ -582,9 +542,10 @@ and channel values, behind one mutex with priority inheritance.
 | `src/backend_adi.c` | real KBUS: `dlopen` of `libdal`, ADI device scan, KBUS-info, cycle |
 | `src/backend_sim.c` | simulated node (12 DI, 8 DO, 4 AI, 4 AO; DI1–8 follow DO1–8, AI4 follows AO1) |
 | `src/gateway.c/.h` | channel map, process images, real-time cycle thread, bulk read/write under one lock |
-| `src/http_server.c/.h` | socket handling, single-channel and bulk decoding, response writing |
+| `src/http_server.c/.h` | socket handling (one read, one answer), HTTP priority, request log |
 | `src/wda.c/.h` | wdx data layer: parameter table (built once), JSON:API output, minimal JSON reader for PATCH |
 | `src/log.c/.h` | stderr or syslog |
+| `web/index.html` + `src/web_asset.S` | the web page (3.5), embedded into the binary |
 
 ### 6.3 The native package
 
@@ -611,7 +572,7 @@ and channel values, behind one mutex with priority inheritance.
 | `RTLD_DEFAULT undeclared` with the WAGO toolchain | older glibc headers need `_GNU_SOURCE` | `#define _GNU_SOURCE` in `backend_adi.c` |
 | `LOG_INFO redefined` | `<syslog.h>` defines `LOG_INFO` too | syslog code in its own file `log.c` |
 | own log lines appeared as `kbus:` | WAGO's KBUS library calls `openlog("kbus")` during initialisation | the gateway sets its own ident again for every message |
-| log flooded (14+ lines/s) | every cyclic write from CODESYS was logged | `HTTP_LOG=1` logs only writes that change an output |
+| log flooded (14+ lines/s) | every cyclic write from a CODESYS client was logged | `HTTP_LOG=1` logs only writes that change an output |
 | `opkg`: `Removing obsolete file .` / unlink error on upgrade | the archives contained the root entry `./` | archives contain `./usr`, `./etc` ... only |
 | `sleep: invalid number '0.5'` | BusyBox `sleep` takes whole seconds | init script waits in steps of 1 s |
 | wdx id lookup slow | ids were formatted for every request | id table built once at startup |
@@ -626,6 +587,7 @@ and channel values, behind one mutex with priority inheritance.
 ├── Makefile                   native / cross build; ADI backend when sdk/include/dal exists
 ├── VERSION                    package version
 ├── src/                       the program (6.2)
+├── web/index.html             the web page at / (3.5), built into the program
 ├── packaging/ipk/             init script, config file, opkg control scripts
 ├── sdk/                       SDK headers (imported, 2.3) + OsCommon.h stand-in
 ├── tools/
@@ -633,9 +595,9 @@ and channel values, behind one mutex with priority inheritance.
 │   ├── deploy.sh              build + copy + opkg install + status
 │   ├── import-sdk-packages.sh headers from the prebuilt SDK packages (2.3 A)
 │   ├── import-sdk-headers.sh  headers from a built SDK sysroot (2.3 B)
-│   └── test-rest.py           tests: reference, bulk, wdx, real node
+│   └── test-rest.py           tests: wdx (simulation), real node read-only / write
 ├── codesys-wdx/               CODESYS application via the wdx data layer (ST + brief)
-├── codesys/                   CODESYS project of the REST client tests
+├── codesys/                   CODESYS project of the earlier REST client tests (version 1.x)
 └── Information/               WAGO example (MIT) and documentation
 ```
 
@@ -643,21 +605,15 @@ and channel values, behind one mutex with priority inheritance.
 
 ```bash
 make run-sim                                   # native build, simulated node on http://localhost:8000
-tools/test-rest.py 127.0.0.1 sim               # 31 reference cases + special cases
-tools/test-rest.py 127.0.0.1 bulk              # bulk requests
-tools/test-rest.py 127.0.0.1 wda               # wdx data layer (incl. PATCH and error codes)
+tools/test-rest.py 127.0.0.1 wda               # wdx data layer: all requests, PATCH, error codes
 tools/deploy.sh 192.168.1.17                   # then: build .ipk, install on the PFC, status
 ```
 
 The VS Code tasks (*Terminal → Run Task*) cover the same steps. Without
 `sdk/include/dal` the native build is simulation-only, which is enough for
-all HTTP and channel-map work.
+all data-layer and channel-map work.
 
 ### 7.3 Common changes
-
-**Change the single-channel interface.** `decode_single()` in
-[src/http_server.c](src/http_server.c) is deliberately a byte-for-byte copy
-of the CODESYS reference; any change makes the gateway differ from it.
 
 **Change the wdx data layer.** The parameter tree is built in `build_list()`
 in [src/wda.c](src/wda.c); paths in `path_of()`, types in `dtype_of()`,
@@ -720,8 +676,8 @@ override it.
   and PFC200). Digital inputs, analog modules and the 750-495 were tested with
   the simulation node. The `armhf` package for PFC100/PFC200 builds but has
   not been installed yet.
-- **All interfaces are unencrypted and have no authentication**, exactly as
-  the CODESYS reference. Anyone who can reach port 8000 can read all I/O and
+- **The wdx data layer is unencrypted and has no authentication** (unlike the
+  firmware's own WDA). Anyone who can reach port 8000 can read all I/O and
   switch outputs. Use it only on an isolated machine network, set
   `HTTP_WRITE_ENABLE=0` when writing is not needed, and block the port in the
   PFC firewall for other networks.

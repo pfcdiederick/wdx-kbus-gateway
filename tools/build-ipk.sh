@@ -62,7 +62,7 @@ Maintainer: pfcdiederick
 Installed-Size: $SIZE
 Depends: dal, libdbuskbuscommon
 Source: https://github.com/pfcdiederick/docker-kbus-gateway
-Description: KBUS HTTP gateway: KBus DI/DO/AI/AO over REST (wdx-style /wda/parameters, bulk /ALL, single channels)
+Description: KBUS gateway: KBus DI/DO/AI/AO as wdx data layer over HTTP (/wda/parameters, JSON:API)
 EOF
 
 echo ">>> 3/3 ipk"

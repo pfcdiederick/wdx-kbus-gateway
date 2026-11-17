@@ -369,7 +369,7 @@ int gateway_read(io_kind_t kind, size_t number, int64_t *value)
 }
 
 // Did the last gateway_write / gateway_write_multi change any output value?
-// (Only used by the single-threaded REST server, to log real changes only.)
+// (Only used by the single-threaded HTTP server, to log real changes only.)
 static int last_write_changed;
 int gateway_write_changed(void) { return last_write_changed; }
 

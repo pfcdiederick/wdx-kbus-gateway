@@ -490,12 +490,6 @@ static int parse_scalar(const char *s, size_t n, int digital, int32_t *out)
 // ---------------------------------------------------------------------------
 // Request handling
 // ---------------------------------------------------------------------------
-int wda_match(const char *req, size_t len)
-{
-    return (len >= 8 && memcmp(req, "GET /wda", 8) == 0) ||
-           (len >= 10 && memcmp(req, "PATCH /wda", 10) == 0);
-}
-
 // "page[limit]=N" or URL encoded "page%5Blimit%5D=N" in the query string.
 static long query_int(const char *q, size_t qlen, const char *name, long def)
 {
@@ -683,7 +677,11 @@ int wda_handle(const char *req, size_t len, const gw_config_t *cfg, wbuf_t *b)
 {
     wda_init();
 
+    // The wdx data layer is the only interface: GET and PATCH, nothing else.
     const int patch = (len >= 6 && memcmp(req, "PATCH ", 6) == 0);
+    const int get   = (len >= 4 && memcmp(req, "GET ", 4) == 0);
+    if (!patch && !get)
+        return error(b, 405, "Method Not Allowed", "use GET or PATCH on /wda/parameters");
     size_t pos = patch ? 6 : 4;
     size_t end = pos;
     while (end < len && req[end] != ' ' && req[end] != '\r' && req[end] != '\n')

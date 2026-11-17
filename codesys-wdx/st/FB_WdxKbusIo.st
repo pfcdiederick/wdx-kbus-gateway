@@ -2,7 +2,7 @@
 // FB_WdxKbusIo  -  cyclic KBus I/O through the wdx data layer of kbus-gateway
 // Object type in CODESYS: POU, Function Block, language ST
 // Uses: FB_HttpTransaction, F_AppendStr, F_FindBytes, GVL_KbusRest
-// Needs kbus-gateway 1.1.0 or newer (wdx interface /wda/parameters, filter[id]).
+// Needs kbus-gateway 1.1.0 or newer (wdx interface /wda/parameters, filter[id]); 2.0.0 has only this interface.
 //
 // Every exchange is the SAME fixed sequence (constant timing):
 //   1. PATCH /wda/parameters/0-0-kbus-digitaloutputvalues   (if uiNumDO > 0)  -> 204

@@ -50,7 +50,7 @@ const io_channel_t *gateway_channel(io_kind_t kind, size_t number);   // number 
 int                 gateway_read(io_kind_t kind, size_t number, int64_t *value);
 int                 gateway_write(io_kind_t kind, size_t number, int64_t value);
 
-// Bulk access (REST /DI /DO /AI /AO /ALL): one lock for all channels.
+// Bulk access (wdx array parameters, filter[id]): one lock for all channels.
 void gateway_snapshot(uint16_t out[IO_KIND_COUNT][GW_MAX_CHANNELS]);
 int  gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT]);
 // 1 when the last gateway_write / gateway_write_multi changed an output value.

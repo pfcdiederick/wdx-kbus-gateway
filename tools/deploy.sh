@@ -47,4 +47,4 @@ echo ">>> 3/3 status"
 # shellcheck disable=SC2016
 $SSH 'sleep 3; /etc/init.d/kbus-gateway status; P=$(cat /var/run/kbus-gateway.pid 2>/dev/null);
       grep "kbus-gateway\[$P\]" /var/log/messages | tail -12'
-echo ">>> done. Test: curl http://$PFC:8000/ALL   or   tools/test-rest.py $PFC node"
+echo ">>> done. Test: curl -g 'http://$PFC:8000/wda/parameters?page[limit]=5'   or   tools/test-rest.py $PFC node"

@@ -21,7 +21,7 @@ GW_LDLIBS  := -ldl
 
 SRCS := src/main.c src/log.c src/config.c src/gateway.c src/http_server.c src/wda.c \
         src/backend_sim.c src/backend_adi.c
-OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
+OBJS := $(SRCS:src/%.c=$(BUILD)/%.o) $(BUILD)/web_asset.o   # web page built into the binary
 
 ifneq ($(wildcard $(SDK)/include/dal/adi_application_interface.h),)
   CPPFLAGS += -DHAVE_WAGO_ADI
@@ -32,8 +32,8 @@ ifneq ($(wildcard $(SDK)/include/dal/adi_application_interface.h),)
   CPPFLAGS += $(addprefix -idirafter ,$(wildcard $(SDK_DIRS)))
   ADI_STATE := with WAGO ADI/DAL backend
 else ifeq ($(REQUIRE_ADI),1)
-  $(error WAGO SDK headers not found in $(SDK)/include. Run tools/import-sdk-headers.sh \
-          first, or build a simulation-only image with --build-arg REQUIRE_ADI=0)
+  $(error WAGO SDK headers not found in $(SDK)/include. Run tools/import-sdk-packages.sh \
+          first (README 2.3), or build simulation-only with REQUIRE_ADI=0)
 else
   ADI_STATE := SIMULATION ONLY (no sdk/include)
 endif
@@ -48,6 +48,10 @@ $(TARGET): $(OBJS)
 
 $(BUILD)/%.o: src/%.c src/*.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(GW_CFLAGS) $(CFLAGS) -c -o $@ $<
+
+# web/index.html is embedded with .incbin (path relative to the project root)
+$(BUILD)/web_asset.o: src/web_asset.S web/index.html | $(BUILD)
+	$(CC) -c -o $@ $<
 
 $(BUILD):
 	mkdir -p $@

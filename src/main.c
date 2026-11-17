@@ -2,8 +2,8 @@
 //
 // Reads and writes the DI / DO / AI / AO channels of the I/O modules on the
 // KBUS of a WAGO PFC100/PFC200/PFC300 through the ADI/DAL interface, and
-// serves them over HTTP: single channels (GET /DI/1 -> "DI1=TRUE"), bulk
-// (/ALL) and a wdx-style data layer (/wda/parameters, JSON:API).
+// serves them over HTTP as a wdx data layer (/wda/parameters, JSON:API, WAGO
+// wdx/WDA conventions).
 // Runs natively on the PTXdist firmware (opkg package, tools/build-ipk.sh).
 #include "backend.h"
 #include "config.h"
