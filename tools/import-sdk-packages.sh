@@ -12,7 +12,7 @@
 #   dal_<version>_<arch>.tgz                -> sdk/include/dal/*
 #   libdbuskbuscommon_<version>_<arch>.tgz  -> sdk/include/ldkc_kbus_information.h
 # The <arch> of the package does not matter: headers are source code and are
-# compiled for the PFC by the Docker build.
+# compiled for the PFC by tools/build-ipk.sh.
 set -euo pipefail
 
 PKG=${1:?usage: $0 <packages-dir>}

@@ -1,6 +1,0 @@
-# Keep the build context small: only Makefile, src/, sdk/ and docker/ are needed.
-*
-!Makefile
-!src/
-!sdk/
-!docker/

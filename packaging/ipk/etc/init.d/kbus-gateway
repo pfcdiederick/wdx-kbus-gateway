@@ -1,0 +1,64 @@
+#!/bin/bash
+#-----------------------------------------------------------------------------#
+# /etc/init.d/kbus-gateway  -  KBUS HTTP gateway (native installation)
+#
+#   start | stop | restart | status
+#
+# Settings: /etc/kbus-gateway.conf. Log: /var/log/messages (kbus-gateway).
+# Only one program may own the KBUS: set WBM > PLC Runtime to "None", or run
+# the CODESYS runtime without KBUS, before starting the gateway.
+#-----------------------------------------------------------------------------#
+NAME=kbus-gateway
+DAEMON=/usr/bin/kbus-gateway
+CONF=/etc/kbus-gateway.conf
+PIDFILE=/var/run/kbus-gateway.pid
+SSD=/sbin/start-stop-daemon
+
+running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+start() {
+    if running; then
+        echo "$NAME already running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    # export every variable of the config file to the daemon
+    set -a
+    [ -f "$CONF" ] && . "$CONF"
+    set +a
+    echo -n "Starting $NAME... "
+    if $SSD -S -b -m -p "$PIDFILE" -x "$DAEMON"; then
+        sleep 1
+        if running; then echo "done."; return 0; fi
+    fi
+    echo "failed (see /var/log/messages)"
+    rm -f "$PIDFILE"
+    return 1
+}
+
+stop() {
+    echo -n "Stopping $NAME... "
+    if running; then
+        $SSD -K -p "$PIDFILE" -x "$DAEMON" >/dev/null 2>&1
+        # outputs are switched off by the gateway on SIGTERM; wait for the exit
+        # (BusyBox sleep takes whole seconds only)
+        for _ in 1 2 3 4 5; do
+            running || break
+            sleep 1
+        done
+        running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+    echo "done."
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)
+        if running; then echo "$NAME running (pid $(cat "$PIDFILE"))"; exit 0
+        else echo "$NAME stopped"; exit 3; fi ;;
+    *) echo "usage: $0 start|stop|restart|status"; exit 1 ;;
+esac

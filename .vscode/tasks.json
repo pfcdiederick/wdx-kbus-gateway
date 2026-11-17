@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "make (native)",
+            "label": "make (native, PC)",
             "type": "shell",
             "command": "make",
             "problemMatcher": ["$gcc"],
@@ -16,27 +16,27 @@
             "problemMatcher": []
         },
         {
-            "label": "buildx: image for PFC (linux/arm/v7)",
+            "label": "test: reference + bulk + wdx (simulation on port 8000)",
             "type": "shell",
-            "command": "docker buildx build --platform linux/arm/v7 -t kbus-gateway:latest --load .",
+            "command": "python3 tools/test-rest.py 127.0.0.1 sim && python3 tools/test-rest.py 127.0.0.1 bulk && python3 tools/test-rest.py 127.0.0.1 wda",
             "problemMatcher": []
         },
         {
-            "label": "buildx: simulation image (linux/amd64)",
+            "label": "build-ipk: PFC300 (arm64)",
             "type": "shell",
-            "command": "docker buildx build --platform linux/amd64 --build-arg REQUIRE_ADI=0 -t kbus-gateway:sim --load .",
+            "command": "tools/build-ipk.sh arm64",
             "problemMatcher": []
         },
         {
-            "label": "deploy to PFC",
+            "label": "deploy to PFC (build, opkg install, status)",
             "type": "shell",
-            "command": "tools/deploy.sh ${input:pfcAddress}",
+            "command": "tools/deploy.sh ${input:pfcIp}",
             "problemMatcher": []
         }
     ],
     "inputs": [
         {
-            "id": "pfcAddress",
+            "id": "pfcIp",
             "type": "promptString",
             "description": "IP address of the PFC",
             "default": "192.168.1.17"

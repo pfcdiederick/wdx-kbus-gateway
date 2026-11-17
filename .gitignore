@@ -22,3 +22,6 @@ codesys/*.bootinfo_guids
 codesys/*.precompilecache
 codesys/*.~u
 codesys/*.backup
+
+# Native packages (tools/build-ipk.sh)
+build-ipk/

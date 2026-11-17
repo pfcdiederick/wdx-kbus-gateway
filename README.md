@@ -1,27 +1,36 @@
 # KBUS HTTP Gateway
 
-A Docker application for WAGO PFC100 / PFC200 / PFC300 controllers that reads and writes
-the channels of the **DI / DO / AI / AO** modules on the KBUS and makes them
-available through a REST interface.
+A small native application for WAGO PFC100 / PFC200 / **PFC300** controllers
+that reads and writes the channels of the **DI / DO / AI / AO** modules on the
+KBUS and makes them available over HTTP. It is installed as a normal firmware
+package (`.ipk`) on the PTXdist firmware, starts at boot and runs the KBUS
+cycle with real-time priority. No Docker is needed on the controller.
 
-For single channels, the REST interface behaves exactly like the CODESYS
-application *REST I/O server on PFC200* (reference behaviour version 1.0,
-11-11-2026): same port, same requests, same response bytes. On top of that,
-**bulk requests** read or write all channels in one request (see
-[3.4](#34-bulk-requests-all-channels-in-one-request)).
+Three ways to reach the same KBUS data, all on port 8000:
 
 ```
-GET  http://<pfc-ip>:8000/DI/1             -> DI1=TRUE      first digital input
-GET  http://<pfc-ip>:8000/AI/2             -> AI2=16384     second analog input (raw value)
-POST http://<pfc-ip>:8000/DO/3  body TRUE  -> DO3=TRUE      switch the third digital output on
-GET  http://<pfc-ip>:8000/ALL              -> DI=0110;DO=00100000;AI=16384;AO=0     everything
-POST http://<pfc-ip>:8000/ALL  body DO=00100001;AO=500  -> write all outputs, read everything
+GET   http://<pfc-ip>:8000/DI/1                       -> DI1=TRUE         single channel
+POST  http://<pfc-ip>:8000/DO/3   body TRUE           -> DO3=TRUE         switch one output
+GET   http://<pfc-ip>:8000/ALL                        -> DI=0110;DO=00100000;AI=16384;AO=0
+POST  http://<pfc-ip>:8000/ALL    body DO=00100001    -> write all outputs, read everything
+GET   http://<pfc-ip>:8000/wda/parameters/0-0-kbus-digitaloutputs-3-value   (wdx data layer, JSON:API)
 ```
 
-It is based on the WAGO example *HowTo_ADI-MyKBusApplikation* in
-[`Information/`](Information/HowTo_ADI-MyKBusApplikation/README.md). It uses the
-same ADI/DAL calls (`kbusdemo.c`) and the same KBUS module discovery
-(`getkbusinfo.c`).
+- **Single channels** behave exactly like the CODESYS application *REST I/O
+  server on PFC200* (reference behaviour 1.0, 11-11-2026): same requests, same
+  response bytes.
+- **Bulk requests** exchange all channels in one request.
+- The **wdx data layer** presents the KBUS as parameters following the WAGO
+  wdx / WDA conventions (paths, ids, data types, GET/PATCH, JSON:API). A
+  CODESYS application that reads and controls the KBUS through it is in
+  [codesys-wdx/](codesys-wdx/README.md).
+
+The KBUS access is based on the WAGO example *HowTo_ADI-MyKBusApplikation* in
+[`Information/`](Information/HowTo_ADI-MyKBusApplikation/README.md) (same ADI/DAL
+calls as `kbusdemo.c`, same module discovery as `getkbusinfo.c`).
+
+Tested on a **PFC300 750-8302, firmware 04.08.09(30)**: version 1.1.3, real KBUS
+with one 8DO module, used by a CODESYS application at the same time.
 
 ---
 
@@ -31,74 +40,83 @@ same ADI/DAL calls (`kbusdemo.c`) and the same KBUS module discovery
 2. [Installation](#2-installation)
 3. [Using the gateway](#3-using-the-gateway)
 4. [Configuration](#4-configuration)
-5. [Modifying the application](#5-modifying-the-application)
-6. [Troubleshooting](#6-troubleshooting)
-7. [Limitations and security](#7-limitations-and-security)
+5. [Speed and determinism](#5-speed-and-determinism)
+6. [How it was built](#6-how-it-was-built)
+7. [Modifying the application](#7-modifying-the-application)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Limitations and security](#9-limitations-and-security)
 
 ---
 
 ## 1. How it works
 
 ```
- Browser / SCADA / script                      PFC100 / PFC200 / PFC300
- ───────────────────────            ┌──────────────────────────────────────────────┐
-                                    │ Docker container "kbus-gateway"              │
-  GET  /DI/1 ───────────────────────┼─▶ REST server (port 8000)                    │
-  POST /DO/1  "1"                   │        │ read / write                        │
-                                    │        ▼                                     │
-                                    │   channel map + process images (mutex)       │
-                                    │        ▲                                     │
-                                    │        │ every 10 ms, SCHED_FIFO prio 40     │
-                                    │   KBUS cycle thread                          │
-                                    │    WriteBytes → libpackbus_Push → ReadBytes  │
-                                    │        │ dlopen()                            │
-                                    └────────┼─────────────────────────────────────┘
-                                             ▼  (bind-mounted from the firmware)
-                                    /usr/lib/libdal.so, /usr/lib/dal/libpackbus.so,
-                                    KBUS-info over D-Bus  ──▶  KBUS  ──▶  I/O modules
+ CODESYS / browser / SCADA / script                     WAGO PFC (PTXdist firmware)
+ ──────────────────────────────────          ┌───────────────────────────────────────────────┐
+                                             │ /usr/bin/kbus-gateway  (started by init.d)    │
+  GET  /DI/1                ─────────────────┼─▶ REST server thread  (port 8000)             │
+  POST /ALL   DO=0100...                     │     single channels · bulk /ALL · wdx /wda    │
+  PATCH /wda/parameters/...                  │        │ read / write (mutex)                 │
+                                             │        ▼                                      │
+                                             │   channel map + process images in memory     │
+                                             │        ▲                                      │
+                                             │        │ every 10 ms, SCHED_FIFO prio 40      │
+                                             │   KBUS cycle thread                           │
+                                             │    write outputs → libpackbus_Push → read in  │
+                                             │        │ dlopen() of the firmware's own       │
+                                             │        ▼ /usr/lib/libdal.so, KBUS-info (D-Bus)│
+                                             └────────┼──────────────────────────────────────┘
+                                                      ▼
+                                              KBUS ──▶ I/O modules
 ```
 
 **Startup**
 
-1. The WAGO libraries (`libdal.so` and dependencies) are loaded with `dlopen()`
-   from the controller's own `/usr/lib`, which is mounted read-only into the
-   container. The image therefore always uses the libraries that belong to the
-   installed firmware.
+1. The WAGO libraries (`libdal.so`, `libdbuskbuscommon.so` and the DAL plugins
+   in `/usr/lib/dal`) are loaded with `dlopen()` from the firmware's own
+   `/usr/lib`. They are not linked into the program, so it always uses the
+   libraries of the installed firmware; the build only needs their headers.
 2. The KBUS device (`libpackbus`) is opened and set to application state
-   *Unconfigured*. The modules are then read through the KBUS-info D-Bus
+   *Unconfigured*. The modules are read through the KBUS-info D-Bus
    interface, as in `getkbusinfo.c`: position, type, bit offsets and sizes,
    and number of channels.
-3. A **channel map** is built, as in the reference application. Channels are
+3. A **channel map** is built, as in the CODESYS reference. Channels are
    numbered from 1, separately for each type, in module order from left to
-   right. At most 250 modules and 250 channels per type are handled.
+   right. At most 250 modules and 250 channels per type.
    - **Digital module** (type code bit 15 set): every input bit is a `DI` and
      every output bit is a `DO`. Only channels 1–16 of a module exchange
      data; a higher channel still takes a number but reads `FALSE` (DI) or
      only keeps the written value (DO).
-   - **Analog module** with only input data → `AI`, with only output data → `AO`.
-     Channel *k* is the unsigned 16-bit word at byte offset 2·(k−1) of the
-     module data (at most 48 bytes), raw value.
+   - **Analog module** with only input data → `AI`, with only output data →
+     `AO`. Channel *k* is the unsigned 16-bit word at byte offset 2·(k−1) of
+     the module data (at most 48 bytes), raw value.
    - **750-495** gets no channels; its measured values are not available.
    - **Other modules** (data in both directions, e.g. counters or serial
      interfaces) get no channels; their outputs stay 0.
 4. The KBUS is switched to application state *Running*. From then on the
    gateway drives every bus cycle itself, as in `kbusdemo.c`.
+5. The REST server starts (optionally with real-time priority, see
+   `HTTP_PRIORITY`) and builds the parameter table of the wdx data layer once.
 
-**Cycle thread.** Every `KBUS_CYCLE_MS` (default 10 ms) a real-time thread
-writes the output image, triggers one cycle with `libpackbus_Push` and reads
-the input image. WAGO output modules switch their outputs off if no cycle
-arrives within **50 ms**, so this thread runs with `SCHED_FIFO` priority and
-the REST server never blocks it.
+**KBUS cycle thread.** Every `KBUS_CYCLE_MS` (default 10 ms) a real-time
+thread (`SCHED_FIFO`, priority 40) copies the output image, triggers one cycle
+with `libpackbus_Push` and stores the input image. WAGO output modules switch
+their outputs off when no cycle arrives within **50 ms**, so this thread never
+waits for the REST server: the shared images are locked only for the copy,
+not during the bus cycle.
 
-**HTTP requests** only touch an in-memory copy of the process images:
+**HTTP requests** only touch the in-memory process images:
 
 - Reading an input returns the value of the last bus cycle.
 - Writing an output changes the output image; the next cycle (≤ 10 ms later)
-  sends it to the module.
+  sends it to the module. All values of one bulk or array write are applied
+  under one lock, so they reach the modules in the same cycle.
 - Reading an output returns the value that was last commanded.
 
-**Shutdown.** `docker stop` sends SIGTERM. The gateway sets all outputs to 0,
-runs one last cycle and closes the KBUS device.
+**Shutdown.** `/etc/init.d/kbus-gateway stop` (also at shutdown) sends
+SIGTERM. The gateway sets all outputs to 0, runs one last cycle and closes the
+KBUS device. If the program crashes, the output modules switch off on their
+own after 50 ms without a cycle.
 
 **Digital offset.** In the process image the digital data sits behind the
 analog data. The gateway asks libpackbus where the digital area starts
@@ -106,372 +124,174 @@ analog data. The gateway asks libpackbus where the digital area starts
 are relative to that area, they are shifted; this is detected automatically
 and logged at startup. See `KBUS_DIGITAL_OFFSET_MODE`.
 
+**Package on the controller**
+
+| File | Purpose |
+|---|---|
+| `/usr/bin/kbus-gateway` | the program (about 56 KB) |
+| `/etc/init.d/kbus-gateway` | `start`, `stop`, `restart`, `status` |
+| `/etc/rc.d/S99_kbus-gateway` | boot link, created by the package |
+| `/etc/kbus-gateway.conf` | settings (section 4); kept on package updates when you changed it |
+| `/var/log/messages` | log (syslog, `kbus-gateway[pid]`) |
+
 ---
 
 ## 2. Installation
 
-This is the complete procedure as it was carried out and tested on a
-**PFC200 750-8217, firmware 04.09.50 (FW31)**, with the image built on a Linux
-PC. Commands marked *PC* run in the project directory on the development PC;
-commands marked *PFC* run on the controller (`ssh root@<pfc-ip>`). The
-examples use `192.168.1.17`.
+Commands marked *PC* run in the project directory on a Linux PC; commands
+marked *PFC* run on the controller (`ssh root@<pfc-ip>`). The examples use
+`192.168.1.17`.
 
-For a **PFC300** (64-bit) the procedure is the same apart from the points in
-[2.10](#210-pfc300-64-bit). [tools/deploy.sh](tools/deploy.sh) detects the
-controller type itself.
-
-Quick route once everything is set up (steps 2.3–2.6 in one go):
+Quick route once the PC is set up (2.1):
 
 ```bash
-tools/deploy.sh 192.168.1.17                       # PC: build, save, copy, load, start
-tools/test-rest.py 192.168.1.17 node               # PC: read-only check
+tools/deploy.sh 192.168.1.17               # PC: build .ipk, copy, opkg install, show status
+tools/test-rest.py 192.168.1.17 node       # PC: read-only check
 ```
 
-### 2.1 Requirements
+### 2.1 Requirements on the PC
 
-| Where | What |
+| What | Why |
 |---|---|
-| PC | Linux with Docker and **docker buildx** (`docker buildx version`). No QEMU needed: the build cross-compiles |
-| PC | Python 3 (only for the test script) and SSH/scp access to the PFC as `root` |
-| PC | A **WAGO firmware SDK** checkout with its prebuilt packages, e.g. `~/Documents/WagoFirmware/pfc300-firmware-sdk` (see 2.2) |
-| PFC | Docker enabled (WBM → *Docker*) |
-| PFC | No PLC application using the KBUS: only **one KBUS master** is allowed (see 2.4) |
+| Linux PC with **Docker** | only to run WAGO's SDK build image with the firmware toolchain (the controller needs no Docker) |
+| The **WAGO firmware SDK** of your controller, e.g. [pfc300-firmware-sdk](https://github.com/WAGO/pfc300-firmware-sdk), with its builder image: `make builder` → `pfc300-builder:latest` | toolchain with the same GCC and glibc as the firmware |
+| The **WAGO SDK headers** in `sdk/include` (2.3) | ADI/DAL and KBUS-info API; proprietary, not in this repository |
+| Python 3 | only for the test script |
+| SSH/scp access to the PFC as `root` | install |
 
-Check the PFC once (*PC*):
+### 2.2 Prepare the PFC
+
+Only **one KBUS master** is allowed. Either set WBM → *PLC Runtime* → runtime
+version **None**, or run the CODESYS runtime **without KBUS** in its project
+(for example CODESYS in a container with the KBUS drivers switched off, see
+[docker-codesys3-wagopfc](https://github.com/pfcdiederick/docker-codesys3-wagopfc)).
+
+Check the controller once (*PC*):
 
 ```bash
-ssh root@192.168.1.17 'cat /etc/REVISIONS; docker info -f "{{.DockerRootDir}}"; ls -l /usr/lib/libdal.so*; /lib/libc.so.6 | head -1'
+ssh root@192.168.1.17 'uname -m; cat /etc/REVISIONS; ls -l /usr/lib/libdal.so*; /lib/libc.so.6 | head -1; opkg list-installed | grep -E "^(dal|libdbuskbuscommon) "'
 ```
 
-Note the firmware version, the `libdal.so.<version>` and the glibc version
-(FW31: `libdal.so.1.0.1`, glibc 2.35).
+PFC300 FW 04.08.09(30): `aarch64`, `libdal.so.1.0.1`, glibc 2.35, packages
+`dal 1.0.1` and `libdbuskbuscommon 1.0.0.0` (the package depends on both).
 
-### 2.2 Get the SDK header files
+### 2.3 Get the SDK header files
 
 The real KBUS backend is compiled against the ADI/DAL and KBUS-info **header
-files** of the WAGO SDK. The libraries themselves are not built in; at runtime
-the gateway loads the controller's own libraries.
+files** of the WAGO SDK. They carry a WAGO "proprietary rights" notice and are
+therefore **not in this repository**; import them once:
 
-> **Not in the git repository.** The WAGO headers are proprietary, so a fresh
-> clone has no `sdk/include/dal/`. Import them with one of the two ways below
-> before building the real (non-simulation) image.
-
-Two ways:
-
-**A. From the prebuilt packages (no SDK build needed; used for the test).**
-Every WAGO firmware SDK checkout contains the packages
-`dal_<version>_<arch>.tgz` and `libdbuskbuscommon_<version>_<arch>.tgz` in
-`ptxproj/configs/<platform>/packages/` (*PC*):
+**A. From the prebuilt packages of the SDK (no SDK build needed).** Every
+WAGO firmware SDK checkout contains `dal_<version>_<arch>.tgz` and
+`libdbuskbuscommon_<version>_<arch>.tgz` in `ptxproj/configs/<platform>/packages/`:
 
 ```bash
 tools/import-sdk-packages.sh ~/Documents/WagoFirmware/pfc300-firmware-sdk/ptxproj/configs/wago-pfc300/packages
 ```
 
-This fills `sdk/include/` with `dal/*`, `ldkc_kbus_information.h` and a
-minimal `OsCommon.h` stand-in (types and attribute macros only; the real file
-belongs to WAGO's OsLinux library, which has no package).
+This fills `sdk/include/` with `dal/*` and `ldkc_kbus_information.h`. 
+`sdk/include/OsCommon.h` is our own minimal stand-in (types and attribute
+macros only) and is in the repository.
 
-The packages of the **PFC300 SDK (64-bit)** work for a **PFC200 (32-bit)**:
-
-- Headers are source code without architecture-specific parts. The Docker
-  build compiles them with the 32-bit ARM compiler, so pointers and `size_t`
-  get the PFC200 sizes.
-- What must match is the **API version**: the script prints the DAL version
-  of the package; it must equal `libdal.so.<version>` on the PFC (2.1).
-  FW30 PFC300 `dal_1.0.1` = FW31 PFC200 `libdal.so.1.0.1`. The exported
-  `ldkc_KbusInfo_*` functions were compared and are identical.
-- If the versions differ, use the SDK of the PFC's firmware.
-
-**B. From a built SDK (ptxdist).** When the SDK has been built completely
-(`platform-wago-pfc*/sysroot-target/usr/include/dal/` exists):
+**B. From a completely built SDK** (`platform-wago-pfc*/sysroot-target/usr/include/dal/` exists):
 
 ```bash
 tools/import-sdk-headers.sh ~/wago/ptxproj
 ```
 
-> Without `sdk/include` only a **simulation** image can be built
-> (`REQUIRE_ADI=0`), which is enough to test the REST interface (2.8).
+What must match is the **DAL API version**: the script prints the DAL version
+of the package; it must equal `libdal.so.<version>` on the PFC (2.2). The
+headers have no architecture-specific parts: the PFC300 SDK headers (`dal
+1.0.1`) also fit a PFC200 with FW31 (`libdal.so.1.0.1`).
 
-Check (*PC*): `make` must report `with WAGO ADI/DAL backend`.
+Without `sdk/include/dal` only the **simulation** build works (`make`), which
+is enough to develop and test the HTTP interfaces (7.2).
 
-```bash
-make && make clean
-```
-
-### 2.3 Build the image with buildx and save it
-
-*PC*:
-
-```bash
-docker buildx build --platform linux/arm/v7 --build-arg REQUIRE_ADI=1 -t kbus-gateway:latest --load .
-docker save kbus-gateway:latest | gzip > kbus-gateway-armv7.tar.gz
-```
-
-The archive `kbus-gateway-armv7.tar.gz` (about 26 MB) is saved in the project
-directory (`-arm64` for a PFC300, see 2.10). `docker load` reads gzip directly, so it does not need unpacking.
-
-How the build works (see [Dockerfile](Dockerfile)):
-
-- The **build stage** runs natively on the PC and cross-compiles with
-  `arm-linux-gnueabihf-gcc` (Debian trixie). The log must show
-  `built build/kbus-gateway: with WAGO ADI/DAL backend`.
-- The **runtime stage** (`debian:trixie-slim`, linux/arm/v7) only copies the
-  binary and [docker/entrypoint.sh](docker/entrypoint.sh), so no emulation is
-  required.
-- `REQUIRE_ADI=1` makes the build fail when `sdk/include` is missing.
-
-### 2.4 Prepare the PFC
-
-1. Enable Docker in the WBM (*Docker* page) if it isn't already.
-2. Make sure no PLC application uses the KBUS. Either set WBM → *PLC
-   Runtime* → runtime version **None** (permanent), or stop the runtime
-   temporarily: `ssh root@192.168.1.17 /etc/init.d/runtime stop`.
-   A running `pp_codesys3` process without an application is no problem; the
-   gateway log shows `KBUS device opened` when the KBUS is free.
-3. Free space for the image (about 85 MB) in Docker's directory, e.g.
-   `ssh root@192.168.1.17 df -h /media`.
-
-### 2.5 Copy and load the image
+### 2.4 Build the package
 
 *PC*:
 
 ```bash
-scp kbus-gateway-armv7.tar.gz root@192.168.1.17:/tmp/kbus-gateway.tar.gz
-ssh root@192.168.1.17 'docker load -i /tmp/kbus-gateway.tar.gz && rm /tmp/kbus-gateway.tar.gz && docker image prune -f'
+tools/build-ipk.sh arm64        # PFC300        -> build-ipk/kbus-gateway_<version>_arm64.ipk (~28 KB)
+tools/build-ipk.sh armhf        # PFC100/PFC200 -> build-ipk/kbus-gateway_<version>_armhf.ipk (untested)
 ```
 
-`docker image prune` removes the previous, now untagged, image.
+What the script does (details in [6.3](#63-the-native-package)):
 
-### 2.6 Start the container
+1. Runs `make` inside the SDK builder image with WAGO's cross compiler
+   (`aarch64-linux-gnu-gcc` 11.3 of `gcc-Toolchain-2022.08-wago.1`) and
+   `-Werror`, then strips the binary.
+2. Builds the package tree: program, init script, config file, `postinst`,
+   `prerm`, `conffiles`, `control` (version from [VERSION](VERSION)).
+3. Packs it like a PTXdist package: an `ar` archive with `debian-binary`,
+   `control.tar.gz` and `data.tar.gz`.
 
-*PFC* (`ssh root@192.168.1.17`):
+`BUILDER_IMAGE=...` selects another SDK image.
+
+### 2.5 Install, update, remove
+
+**Install** — WBM → *Software Uploads* → upload the `.ipk` → *Install*, or (*PC*):
 
 ```bash
-docker rm -f kbus-gateway 2>/dev/null
-docker run -d --name kbus-gateway --restart unless-stopped \
-    --privileged --network host \
-    -v /usr/lib:/host/usr/lib:ro \
-    -v /var/run/dbus:/var/run/dbus \
-    -v /etc/specific:/etc/specific:ro \
-    -v /etc/config-tools/get_typelabel_value:/etc/config-tools/get_typelabel_value:ro \
-    -v /dev/eeprom:/dev/eeprom \
-    -v /dev/ttyKbus:/dev/ttyKbus \
-    -v /dev/log:/dev/log \
-    -e HTTP_PORT=8000 \
-    kbus-gateway:latest
+scp build-ipk/kbus-gateway_1.1.3_arm64.ipk root@192.168.1.17:/tmp/
+ssh root@192.168.1.17 'opkg install /tmp/kbus-gateway_1.1.3_arm64.ipk && rm /tmp/kbus-gateway_1.1.3_arm64.ipk'
 ```
 
-Every option is needed; each was found missing during the first test:
+`opkg` installs the files, the `postinst` script creates the boot link and
+(re)starts the gateway. `tools/deploy.sh <pfc-ip>` does build, copy, install
+and shows the status and log in one go.
 
-| Option | Why it is needed |
-|---|---|
-| `--privileged` | Real-time priority for the cycle thread, memory locking, and access to the KBUS hardware (`/dev/kbus0`) |
-| `--network host` | The gateway listens directly on the PFC's IP address |
-| `-v /usr/lib:/host/usr/lib:ro` | The firmware's ADI/DAL libraries and DAL device plugins (`/usr/lib/dal/libpackbus.so`). The entrypoint links them into `/tmp/host-libs` **without** the firmware's glibc, rebuilds `/usr/lib/dal` so its relative links resolve, and sets `LD_LIBRARY_PATH` itself |
-| `-v /var/run/dbus:/var/run/dbus` | Module discovery (KBUS-info) uses the system D-Bus |
-| `-v /etc/specific:/etc/specific:ro` | KBUS configuration (`kbusconf.xml`) and KBUS controller firmware read by `libpackbus` |
-| `-v /etc/config-tools/get_typelabel_value:...:ro` + `-v /dev/eeprom:/dev/eeprom` | `libpackbus` runs this tool to read the device type label from the EEPROM |
-| `-v /dev/ttyKbus:/dev/ttyKbus` | Serial link to the KBUS controller; `libpackbus` uses it to load the controller firmware |
-| `-v /dev/log:/dev/log` | `libpackbus` reports to the PFC's syslog (`/var/log/messages`) |
+**Update** — install a newer `.ipk` the same way (raise [VERSION](VERSION)
+first). `prerm` stops the old version, `postinst` starts the new one. Your
+`/etc/kbus-gateway.conf` is kept if you changed it.
 
-Do **not** add `-e LD_LIBRARY_PATH=/host/usr/lib` (older versions of this
-README did): the firmware's `libc.so.6` then clashes with the container's
-loader. `/dev/eeprom` and `/dev/ttyKbus` are symlinks on the PFC; Docker does
-not copy `/dev` symlinks into a container, hence the explicit mounts.
-
-`--restart unless-stopped` starts the gateway again after a reboot or crash.
-
-`docker run` refuses to start when a mounted path does not exist on the
-controller. The last four mounts (`get_typelabel_value`, `/dev/eeprom`,
-`/dev/ttyKbus`, `/dev/log`) may be missing on other controllers or firmware
-versions; leave out the ones that do not exist (`ls -l <path>`).
-[tools/deploy.sh](tools/deploy.sh) does that automatically and prints
-`note: ... not present, not mounted`.
-
-**Port number.** The gateway listens on port **8000** by default, the same
-port as the CODESYS reference. Ports 80 and 443 are taken by the WBM. If the
-port is in use, the log shows `cannot listen on port ...: Address in use
-(retrying)` and the gateway keeps retrying. Another port: `-e HTTP_PORT=8081`
-or `tools/deploy.sh 192.168.1.17 8081`.
-
-**Everything in one command.** [tools/deploy.sh](tools/deploy.sh) carries out
-2.3, 2.5 and 2.6. It asks the controller for its architecture (`uname -m`),
-builds for `linux/arm/v7` or `linux/arm64` accordingly and saves
-`kbus-gateway-armv7.tar.gz` or `kbus-gateway-arm64.tar.gz`. `SKIP_BUILD=1`
-reuses the existing archive; `PLATFORM=linux/arm64` overrides the detection.
+**Operate** (*PFC*):
 
 ```bash
-tools/deploy.sh 192.168.1.17
+/etc/init.d/kbus-gateway status|stop|start|restart
+grep kbus-gateway /var/log/messages | tail -20
 ```
 
-### 2.7 Check the start
+**Remove** — `opkg remove kbus-gateway` (stops it, removes files and boot link;
+all outputs go to 0).
 
-*PC*:
+### 2.6 Check the start
+
+*PFC*: `grep kbus-gateway /var/log/messages | tail -20`. A good start on the
+PFC300 with one 8DO module:
+
+```
+kbus-gateway[21566]: WAGO KBUS HTTP gateway starting
+kbus-gateway[21566]: config: rest=on port=8000 writes=allowed log=writes http-prio=30 cycle=10ms rt-prio=40 mode=kbus
+kbus-gateway[21566]: loaded libdal.so
+kbus-gateway[21566]: loaded libdbuskbuscommon.so
+kbus-gateway[21566]: [INFO] --- Start KBUS initialization. ---       (this and the next lines tagged "kbus:" come from WAGO's KBUS library)
+kbus-gateway[21566]: KBUS device opened
+kbus-gateway[21566]: KBUS: 1 modules, error code 0, bits AI=0 AO=0 DI=0 DO=8, image in=12000 out=12000 bytes
+kbus-gateway[21566]: application state set to 'Running'
+kbus-gateway[21566]: module  1: digital 8DO    in   0 bits @0     out   8 bits @0
+kbus-gateway[21566]: channels: 0 DI, 8 DO, 0 AI, 0 AO; 0 x 750-495
+kbus-gateway[21566]: KBUS cycle thread running: SCHED_FIFO priority 40, every 10 ms
+kbus-gateway[21566]: REST server thread: SCHED_FIFO priority 30
+kbus-gateway[21566]: REST server listening on port 8000 (e.g. GET /DI/1, bulk GET /ALL)
+```
+
+### 2.7 Test
 
 ```bash
-ssh root@192.168.1.17 'docker ps -a --filter name=kbus-gateway; docker logs kbus-gateway'
+tools/test-rest.py 192.168.1.17 node              # real node, READ ONLY: channel counts, reads, invalid requests
+tools/test-rest.py 192.168.1.17 write --do 1      # real node: switches DO1 on/off with pauses (check what is connected!)
+curl http://192.168.1.17:8000/ALL                 # DI=;DO=00000000;AI=;AO=
+curl -g "http://192.168.1.17:8000/wda/parameters?page[limit]=5"
 ```
 
-A good start (log of the test node, one 8DO module):
-
-```
-[info]  WAGO KBUS HTTP gateway starting
-[info]  config: rest=on port=8000 writes=allowed cycle=10ms rt-prio=40 mode=kbus
-[info]  loaded libdal.so
-[info]  loaded libdbuskbuscommon.so
-[info]  KBUS device opened
-[info]  application state set to 'Unconfigured'
-[info]  KBUS: 1 modules, error code 0, bits AI=0 AO=0 DI=0 DO=8, image in=12000 out=12000 bytes
-[info]  digital area starts at byte in=0 out=0; KBUS-info digital offsets are absolute
-[info]  process image used: in 0 of 12000 bytes, out 1 of 12000 bytes
-[info]  application state set to 'Running'
-[info]  module  1: digital 8DO    in   0 bits @0     out   8 bits @0
-[info]  channels: 0 DI, 8 DO, 0 AI, 0 AO; 0 x 750-495
-[info]  KBUS cycle thread running: SCHED_FIFO priority 40, every 10 ms
-[info]  REST server listening on port 8000 (e.g. GET /DI/1)
-```
-
-The status must be `Up`, not `Restarting`. Compare the module list with the
-node. The `libpackbus` messages are in the PFC syslog:
-
-```bash
-ssh root@192.168.1.17 'grep -i kbus /var/log/messages | tail -20'
-```
-
-`Timeout on bootstrap header answer` followed by `Use still active SCPU-FW`
-is normal when the KBUS controller firmware is already running.
-
-### 2.8 Test
-
-[tools/test-rest.py](tools/test-rest.py) compares every response byte for byte
-with the reference behaviour (*PC*):
-
-```bash
-# 1. Real node, read only: finds the channel counts, checks reads and
-#    invalid requests, writes nothing
-tools/test-rest.py 192.168.1.17 node
-
-# 2. Real node, writes: switches DO1 on/off with 3 s pauses so you can watch
-#    the LED; ends with DO1 = FALSE. Check first what is connected!
-tools/test-rest.py 192.168.1.17 write --do 1
-tools/test-rest.py 192.168.1.17 write --ao 1          # analog output, ends at 0
-
-# 3. All reference cases 1-31 and the special cases, on the simulation node
-make run-sim &                                        # or a simulation container
-tools/test-rest.py 127.0.0.1 sim
-```
-
-Every line must say `PASS` and the last line `FAILURES: 0`. A GET on an
-output returns the value last written, not a read-back; watch the module's
-LED (or measure) to confirm that the output really switches.
-
-Run the tests from a PC on the same network. Security software or proxies
-on the path may hold back requests that are not complete HTTP requests; in
-`sim` mode the special cases `noEOL`, `min9`, `short` and `min10` then time
-out. They pass when sent on the PFC itself, e.g.
-`ssh root@192.168.1.17 '(printf "GET /DO/1"; sleep 1) | nc 127.0.0.1 8000'`.
-
-**Simulation on the PFC** (REST test without touching the KBUS):
-
-```bash
-REQUIRE_ADI=0 IMAGE=kbus-gateway:sim EXTRA_RUN_ARGS="-e KBUS_SIMULATION=1 -e KBUS_PRIORITY=0" \
-    tools/deploy.sh 192.168.1.17
-tools/test-rest.py 192.168.1.17 sim
-```
-
-This saves `kbus-gateway-armv7-sim.tar.gz`, so the real archive is kept.
-Run `tools/deploy.sh 192.168.1.17` (or with `SKIP_BUILD=1`) afterwards to go
-back to the real gateway.
-
-**Simulation on the PC.** The simulated node has a 4AI, 4AO, 8DI, 8DO and 4DI
-module. DO1–8 are looped back to DI1–8, and AO1 to AI4.
-
-```bash
-make run-sim                                # native, http://localhost:8000
-# or as a container:
-docker buildx build --platform linux/amd64 --build-arg REQUIRE_ADI=0 -t kbus-gateway:sim --load .
-docker run --rm -p 8000:8000 -e KBUS_SIMULATION=1 kbus-gateway:sim
-```
-
-### 2.9 Stop, update, remove
-
-```bash
-ssh root@192.168.1.17 docker stop kbus-gateway      # all outputs to 0, KBUS released
-ssh root@192.168.1.17 docker start kbus-gateway
-tools/deploy.sh 192.168.1.17                        # update to a new build
-ssh root@192.168.1.17 'docker rm -f kbus-gateway; docker rmi kbus-gateway:latest'   # remove
-```
-
-Stop the container before a CODESYS application takes over the KBUS again.
-
-### 2.10 PFC300 (64-bit)
-
-The PFC300 (750-8302) drives the same 750/753 I/O modules over the KBUS with
-the same WAGO libraries (`libdal`, `libpackbus`, `libdbuskbuscommon`). The
-source code needs no change; the differences are in building and deploying.
-
-| | PFC100 / PFC200 | PFC300 |
-|---|---|---|
-| CPU / `uname -m` | 32-bit ARM, `armv7l` | 64-bit ARM, `aarch64` |
-| buildx platform | `linux/arm/v7` | `linux/arm64` |
-| Cross compiler (chosen by the Dockerfile) | `arm-linux-gnueabihf-gcc` | `aarch64-linux-gnu-gcc` |
-| Archive | `kbus-gateway-armv7.tar.gz` | `kbus-gateway-arm64.tar.gz` |
-| SDK headers (2.2) | packages of a PFC200 or PFC300 SDK with the same DAL version | packages of the PFC300 SDK of the installed firmware (native match) |
-| KBUS controller firmware | loaded by `libpackbus` over `/dev/ttyKbus` when needed | loaded at boot by the firmware itself (`/etc/init.d/check_kbusfw`; libpackbus is built with `NO_FIRMWARE_LOAD`) |
-
-What stays the same (checked in the PFC300 SDK FW30-V04.08.09): glibc 2.35,
-libraries in `/usr/lib`, DAL plugins as relative links in `/usr/lib/dal`,
-`/dev/kbus0` and `/dev/ttyKbus`, `/etc/specific/kbusconf.xml` and
-`get_typelabel_value`. The entrypoint and the run command of 2.6 therefore
-apply unchanged. `/dev/eeprom` is not created by the PFC300 project files; if
-it is missing on the controller, leave that mount out (deploy.sh does this
-automatically).
-
-Steps for a PFC300 (*PC*; `<pfc300-ip>` is its address):
-
-```bash
-# 1. Check the controller: architecture, firmware, DAL and glibc version, devices
-ssh root@<pfc300-ip> 'uname -m; cat /etc/REVISIONS; ls -l /usr/lib/libdal.so*; /lib/libc.so.6 | head -1'
-ssh root@<pfc300-ip> 'ls -l /dev/kbus0 /dev/ttyKbus /dev/eeprom /etc/specific/kbusconf.xml /etc/config-tools/get_typelabel_value'
-
-# 2. Headers from the PFC300 SDK of that firmware (DAL version = libdal.so.<version>)
-tools/import-sdk-packages.sh ~/Documents/WagoFirmware/pfc300-firmware-sdk/ptxproj/configs/wago-pfc300/packages
-
-# 3. Build, save, copy, load, start (detects aarch64 -> linux/arm64)
-tools/deploy.sh <pfc300-ip>
-
-# 4. Check and test as in 2.7 and 2.8
-ssh root@<pfc300-ip> docker logs kbus-gateway
-tools/test-rest.py <pfc300-ip> node
-```
-
-By hand, step 3 is 2.3–2.6 with the other platform and archive name:
-
-```bash
-docker buildx build --platform linux/arm64 --build-arg REQUIRE_ADI=1 -t kbus-gateway:latest --load .
-docker save kbus-gateway:latest | gzip > kbus-gateway-arm64.tar.gz
-scp kbus-gateway-arm64.tar.gz root@<pfc300-ip>:/tmp/kbus-gateway.tar.gz
-ssh root@<pfc300-ip> 'docker load -i /tmp/kbus-gateway.tar.gz && rm /tmp/kbus-gateway.tar.gz'
-# then the docker run command of 2.6 on the PFC300
-```
-
-Status: tested on 16-11-2026 on a PFC300 750-8302 with firmware 04.08.09(30).
-The arm64 image builds without compiler warnings, `tools/deploy.sh` ran
-unchanged, the log showed `KBUS device opened`, the module (1 x 8DO) was
-detected, and `GET /DO/1`–`/DO/8` answered. In that test the PFC300 also
-ran CODESYS3 in a container with its KBus drivers switched off
-(`KBUS=false`, see [docker-codesys3-wagopfc](https://github.com/pfcdiederick/docker-codesys3-wagopfc)),
-so CODESYS can reach the gateway at `http://127.0.0.1:8000`.
-
-**PFC100** (750-810x): 32-bit ARM like the PFC200, so the armv7 image and the
-procedure of 2.1–2.9 apply as they are. Check the DAL version (2.1) and the
-paths of the optional mounts (2.6).
+Simulation tests (all writes allowed) are in 7.2.
 
 ---
 
 ## 3. Using the gateway
 
-### 3.1 Endpoints
+### 3.1 Single channels (CODESYS reference behaviour)
 
 | Request | Condition | Response body (status 200) |
 |---|---|---|
@@ -503,11 +323,9 @@ Rules (identical to the CODESYS reference):
 - Values are **raw process-image values**, as in CODESYS. For example, for a
   750-559 (0–10 V), 0x7FFF = 10 V. Scale them in your application.
 
-### 3.2 Responses
-
-Every response is a status line, two headers, an empty line and a one-line
-body without a line ending. There is no `Content-Length`; the server closes
-the connection. Example (bytes):
+Responses: a status line, two headers, an empty line and a one-line body
+without a line ending. There is no `Content-Length`; the server closes the
+connection.
 
 ```
 HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDO1=TRUE
@@ -515,29 +333,17 @@ HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDO1=TRUE
 
 | Status | Body | When |
 |---|---|---|
-| 200 OK | see 3.1 | valid request |
+| 200 OK | see above | valid request |
 | 403 Forbidden | `Output writes are disabled` | `POST /DO/n` or `/AO/n` while `HTTP_WRITE_ENABLE=0` (checked before the channel count) |
 | 404 Not Found | `Unknown endpoint, channel, or value` | everything else |
 
-### 3.3 Connection handling
+### 3.2 Bulk requests (all channels in one request)
 
-- One client at a time. The server reads **once, at most 512 bytes**, and
-  decodes only those bytes. If headers and body arrive in separate TCP
-  segments, the body is missing and the answer is 404. Send the request in
-  one write (curl does this for small requests).
-- There is no time-out: a client that connects and sends nothing blocks the
-  server until it disconnects.
-- An output keeps its value until it is written again; there is no client
-  monitoring. After a start all outputs are `FALSE` / 0.
-
-### 3.4 Bulk requests (all channels in one request)
-
-An extension that is not in the CODESYS reference. Every single-channel
-request in 3.1 costs one TCP connection. A client that polls many channels
-spends most of its time on connections, and in a PLC every connection takes
-several task cycles. Bulk requests exchange **all channels in one request**,
-and they cost the gateway no more time than a single channel (about 0.15 ms
-measured).
+An extension that is not in the CODESYS reference. Every request costs one
+TCP connection, and in a PLC every connection takes several task cycles, so
+exchanging all channels in **one** request is much faster than one request
+per channel. For the gateway a bulk request costs about the same as a single
+channel.
 
 | Request | Body | Answer body (status 200) |
 |---|---|---|
@@ -554,200 +360,370 @@ curl -X POST -d 10000001 http://192.168.1.17:8000/DO                # DO1 and DO
 curl -X POST -d 'DO=1-------' http://192.168.1.17:8000/ALL          # only DO1 on
 ```
 
-Rules:
-
 - A body may hold **fewer** values than there are channels (the rest stays
   unchanged), never more: that gives 404.
-- Bulk writes are **checked completely first and then applied under one lock**,
-  so the next KBUS cycle sends all of them together. If one value is invalid,
-  **nothing** is written (404).
-- Same rules as 3.1–3.3 otherwise: case-sensitive, body after the first empty
-  line up to the first CR/LF, **one read** (send the request in one TCP
-  write), one client at a time. Bulk requests may be up to 4096 bytes;
+- Bulk writes are **checked completely first and then applied under one
+  lock**; if one value is invalid, **nothing** is written (404).
+- Otherwise the rules of 3.1 apply. Bulk requests may be up to 4096 bytes;
   single-channel requests are still decoded from the first 512 bytes only.
-- The paths without a channel number (`/DO`, `/ALL`) gave 404 before. So the
-  extension changes nothing for clients of the reference behaviour;
-  `tools/test-rest.py <host> sim` still passes unchanged.
+- The paths without a channel number gave 404 in the reference, so the
+  extension changes nothing for clients of the reference behaviour.
 
-Test with the simulation node: `tools/test-rest.py <host> bulk` (34 cases).
+A CODESYS client for `POST /ALL` (one request per exchange) is in
+[docker-codesys3-wagopfc](https://github.com/pfcdiederick/docker-codesys3-wagopfc)
+(`codesys/`).
+
+### 3.3 wdx data layer (`/wda/parameters`)
+
+All KBUS data is also presented as **parameters following the WAGO wdx / WDA
+conventions** (see the training in `Information/WDX/`): one flat list,
+JSON:API 1.0, **GET reads, PATCH writes one parameter**.
+
+| wdx rule | KBUS data |
+|---|---|
+| **path** = hierarchical name | `KBus/DigitalOutputs/3/Value` |
+| **id** = `0-0-` + lower-case path, `/` → `-` | `0-0-kbus-digitaloutputs-3-value` |
+| **dataType** | DI/DO `boolean`, AI/AO `uint16` (raw), counters `uint64`, names `string`, lists `instantiations` |
+| **dataRank** | `scalar` per channel, `array` for a whole class |
+| write rights | `GET .../{id}/definition` → `"writeable": true` only for DO/AO values |
+| persistence | none: process values are volatile |
+
+Parameter tree:
+
+```
+KBus/Healthy                      boolean   R    KBUS cycle running without errors
+KBus/CycleTime                    uint16    R    ms
+KBus/CycleCount, ErrorCount       uint64    R
+KBus/Modules                      instantiations [1..n]
+KBus/Modules/{m}/Name             string    R    e.g. "digital 8DO", "75x-559"
+KBus/Modules/{m}/TypeCode         uint16    R    raw KBUS terminal code
+KBus/Modules/{m}/ChannelCount     uint16    R
+KBus/DigitalInputs                instantiations [1..nDI]
+KBus/DigitalInputs/{n}/Value      boolean   R
+KBus/DigitalInputs/{n}/Module, ModuleChannel   uint16 R   where the channel sits
+KBus/DigitalOutputs/{n}/Value     boolean   R/W
+KBus/AnalogInputs/{n}/Value       uint16    R
+KBus/AnalogOutputs/{n}/Value      uint16    R/W
+KBus/DigitalInputValues           boolean[] R    all DI in one parameter
+KBus/DigitalOutputValues          boolean[] R/W  all DO in one parameter
+KBus/AnalogInputValues            uint16[]  R
+KBus/AnalogOutputValues           uint16[]  R/W
+```
+
+| Request | Answer |
+|---|---|
+| `GET /wda/parameters` | all parameters (`page[limit]`, `page[offset]`) |
+| `GET /wda/parameters?filter[id]=id1,id2` | exactly these parameters, from **one KBUS snapshot** |
+| `GET /wda/parameters/{id}` | one parameter |
+| `GET /wda/parameters/{id}/definition` | path, dataType, dataRank, writeable |
+| `PATCH /wda/parameters/{id}` | write one parameter → **204 No Content** |
+
+```bash
+P=http://192.168.1.17:8000/wda/parameters
+curl -g "$P?page[limit]=5"
+curl -g "$P?filter[id]=0-0-kbus-digitalinputvalues,0-0-kbus-digitaloutputvalues"
+curl $P/0-0-kbus-digitaloutputs-3-value/definition
+curl -X PATCH -H 'Content-Type: application/vnd.api+json' \
+  -d '{"data":{"type":"parameters","id":"0-0-kbus-digitaloutputs-3-value","attributes":{"value":true}}}' \
+  $P/0-0-kbus-digitaloutputs-3-value
+```
+
+A PATCH body is a JSON:API document whose `type` (`parameters`) and `id` must
+match the URL. Every answer carries `Content-Length`. Status codes: `200`,
+`204`, `400` malformed body / type or id mismatch, `403` writes disabled,
+`404` unknown id, `405` wrong method, `409` read-only, value out of range or
+too many values, `415` Content-Type is not `application/vnd.api+json`. Errors
+carry a JSON:API `errors` body.
+
+Differences from the firmware's own WDA (`https://<pfc>/wda`): plain HTTP on
+port 8000, no TLS, no authentication, only the KBUS parameters.
+
+**CODESYS application through the wdx data layer:** [codesys-wdx/README.md](codesys-wdx/README.md),
+with ST code and a ready-to-paste brief for Claude in CODESYS.
+
+### 3.4 Connection handling (all interfaces)
+
+- **One client at a time.** The server reads **once** per connection and
+  decodes only those bytes. If headers and body arrive in separate TCP
+  segments, the body is missing. Send each request in one write (curl and
+  the CODESYS function blocks do this).
+- **One request per connection**; the server closes it after the answer.
+- There is no time-out: a client that connects and sends nothing blocks the
+  server until it disconnects. Clients must close on their own time-out.
+- An output keeps its value until it is written again; there is no client
+  monitoring. After a start all outputs are `FALSE` / 0.
 
 ### 3.5 Live log
 
 ```bash
-ssh root@192.168.1.17 docker logs -f -t kbus-gateway
+ssh root@192.168.1.17 'tail -f /var/log/messages | grep kbus-gateway'
 ```
-
-`HTTP_LOG` (section 4) sets what the REST server logs:
 
 | `HTTP_LOG` | Logged |
 |---|---|
 | `0` | no requests |
-| `1` (default) | every successful write: `write DO3 = 1`, `write DO=10000001`, `write DO=1-------;AO=500` |
-| `2` | **every request**, with client address, request line, status and answer, e.g. `127.0.0.1 "POST /ALL HTTP/1.0" -> 200 DI=;DO=10000000;AI=;AO=` |
+| `1` (default) | writes that **change** an output: `write DO3 = 1`, `write DO=10000001`, `write KBus/DigitalOutputValues = [true,...]` |
+| `2` | **every request**: client, request line, status, answer, e.g. `127.0.0.1 "POST /ALL HTTP/1.0" -> 200 DI=;DO=10000000;AI=;AO=` |
 
-Level 2 is meant for testing a client. A PLC that exchanges every 50 ms writes
-20 lines per second; Docker on the PFC rotates the log (2 MB × 5 files), so the
-storage does not fill up. Enable it with
-`EXTRA_RUN_ARGS="-e HTTP_LOG=2" SKIP_BUILD=1 tools/deploy.sh <pfc-ip>`.
+Level 2 is for testing a client: a CODESYS application that exchanges every
+50 ms writes 20 lines per second. Set it in `/etc/kbus-gateway.conf` and run
+`/etc/init.d/kbus-gateway restart`.
 
 ---
 
 ## 4. Configuration
 
-Set these with `-e NAME=value` on `docker run`:
+`/etc/kbus-gateway.conf` on the PFC (environment variables for the program;
+apply with `/etc/init.d/kbus-gateway restart`):
 
-| Variable | Default | Description |
-|---|---|---|
-| `HTTP_PORT` | `8000` | REST port. Not 80 or 443: the PFC's web interface (WBM) already uses them (see 2.5) |
-| `HTTP_ENABLE` | `1` | `0` = REST server off |
-| `HTTP_WRITE_ENABLE` | `1` | `0` = `POST` on DO/AO answers 403 and writes nothing |
-| `HTTP_LOG` | `1` | `0` = no request log, `1` = log every write, `2` = log every request (3.5) |
-| `KBUS_CYCLE_MS` | `10` | KBUS cycle time, 1–40 ms (stay well below the 50 ms output watchdog) |
-| `KBUS_PRIORITY` | `40` | SCHED_FIFO priority of the cycle thread, `0` = normal scheduling |
-| `KBUS_SIMULATION` | `0` | `1` = simulated I/O, no hardware access |
-| `KBUS_DAL_LIB` | `libdal.so:libdal.so.0:libdal.so.1` | `dlopen()` candidates for the ADI/DAL library |
-| `KBUS_INFO_LIB` | `libdbuskbuscommon.so:...` | candidates for the KBUS-info library (only used when its symbols aren't already loaded) |
-| `KBUS_DIGITAL_OFFSET_MODE` | `auto` | `auto`, `relative` or `absolute`: how digital offsets from KBUS-info are interpreted |
+| Variable | Default (program) | Package file | Description |
+|---|---|---|---|
+| `HTTP_PORT` | `8000` | `8000` | port of all interfaces. Not 80/443: the WBM uses them |
+| `HTTP_ENABLE` | `1` | `1` | `0` = REST server off |
+| `HTTP_WRITE_ENABLE` | `1` | `1` | `0` = outputs read-only: POST/PATCH answer 403 |
+| `HTTP_LOG` | `1` | `1` | 0 none, 1 writes that change an output, 2 every request (3.5) |
+| `HTTP_PRIORITY` | `0` | `30` | SCHED_FIFO priority of the REST server thread, 0 = normal. Keep it **below** `KBUS_PRIORITY` |
+| `KBUS_CYCLE_MS` | `10` | `10` | KBUS cycle, 1–40 ms (stay well below the 50 ms output watchdog) |
+| `KBUS_PRIORITY` | `40` | `40` | SCHED_FIFO priority of the KBUS cycle thread, 0 = normal |
+| `LOG_TARGET` | stderr | `syslog` | `syslog` = `/var/log/messages` |
+| `KBUS_SIMULATION` | `0` | – | `1` = simulated node, no hardware (development) |
+| `KBUS_DAL_LIB` | `libdal.so:libdal.so.0:libdal.so.1` | – | `dlopen()` candidates for the ADI/DAL library |
+| `KBUS_INFO_LIB` | `libdbuskbuscommon.so:...` | – | candidates for the KBUS-info library |
+| `KBUS_DIGITAL_OFFSET_MODE` | `auto` | – | `auto`, `relative` or `absolute` (section 1) |
 
 ---
 
-## 5. Modifying the application
+## 5. Speed and determinism
 
-### 5.1 Project layout
+Measured on the PFC300 (FW 04.08.09(30), version 1.1.3) with `curl` on the
+controller itself, a new TCP connection per request, 1000 requests, while a
+CODESYS application was running:
+
+| Request | median | p95 | p99 | max |
+|---|---|---|---|---|
+| `GET /ALL` | 1.27 ms | 1.78 ms | 10.4 ms | 11.6 ms |
+| wdx `GET ?filter[id]=...` | 1.35 ms | 1.96 ms | 10.6 ms | 13.0 ms |
+| wdx `GET` one parameter (300×) | 1.15 ms | 1.83 ms | – | 10.7 ms |
+| wdx `PATCH` (300×) | 1.25 ms | 1.92 ms | – | 11.1 ms |
+
+On a PC the gateway itself needs < 0.1 ms per request; the rest is TCP
+connect/close on the controller. wdx requests are as fast as `/ALL`.
+
+**The outliers of ~10 ms** (about 3 % of the requests) come from the CODESYS
+runtime: it runs its own real-time threads at priorities 50–83 (`Schedule`
+81, `TaskGapTask` 71, `WagoAsyncRtHigh` 53 …), deliberately above everything
+else, including the KBUS cycle (40) and the REST server (30). A real-time
+client (`chrt -f 20 curl`) showed the same outliers. Raising the gateway
+above CODESYS would disturb the PLC program, so it is not done.
+`HTTP_PRIORITY=30` protects the REST server against all non-real-time load
+(WBM, logging, other programs).
+
+For a CODESYS client the exchange time is set by its **task cycles** (each
+request needs a few: connect, write, read), not by the gateway:
+
+| | requests per exchange | measured at MainTask 10 ms |
+|---|---|---|
+| single channels (`/DO/n`) | one per channel | – (≈ 350 ms per channel at 50 ms task) |
+| bulk `POST /ALL` | 1 | ≈ 70 ms per exchange |
+| wdx (`PATCH` arrays + one `GET`) | 2 (3 with AO) | see [codesys-wdx](codesys-wdx/README.md) |
+
+Rules for constant timing: MainTask 10 ms, a fixed sequence of requests per
+exchange, arrays or `/ALL` instead of single channels, `HTTP_LOG=1`. HTTP over
+TCP is fast but not hard real-time; for hard real-time I/O let CODESYS drive
+the KBUS directly.
+
+---
+
+## 6. How it was built
+
+This chapter records how the gateway came about and why it looks like it does.
+
+### 6.1 History
+
+1. **Reference behaviour.** The starting point was a CODESYS application,
+   *REST I/O server on PFC200* (FbREST, version 1.0, 11-11-2026), that serves
+   the KBUS channels as `GET /DI/1` → `DI1=TRUE`. The gateway reproduces it
+   byte for byte; `tools/test-rest.py <host> sim` checks all 31 reference
+   cases and the special cases (512-byte read, split TCP segments, overflow
+   of the channel number, idle client).
+2. **KBUS access** was taken from the WAGO example
+   *HowTo_ADI-MyKBusApplikation* (`Information/`, MIT licence): ADI/DAL device
+   scan, `libpackbus`, application state *Running*, one `libpackbus_Push` per
+   cycle (`kbusdemo.c`), and the module list through the KBUS-info D-Bus API
+   (`getkbusinfo.c`). The WAGO libraries are loaded with `dlopen()`, so only
+   their headers are needed to build.
+3. **First as a Docker container** (PFC200 750-8217, FW 04.09.50, then PFC300).
+   That worked, but needed many bind mounts and an entrypoint that loads the
+   firmware's libraries without the firmware's glibc (the Docker files are in
+   the git history before version 1.1.3).
+4. **Bulk requests** (`/ALL`) were added when a CODESYS client with one
+   request per channel turned out to be too slow (350 ms per request at a
+   50 ms task; outputs were skipped).
+5. **wdx data layer.** To present the KBUS data like WAGO's own parameter
+   model (training *Communicating with the WAGO CC100 via the wdx Parameter
+   Model & WDA REST Interface*), the `/wda/parameters` interface was added
+   with the same path/id rules, data types, JSON:API format and status codes,
+   plus `filter[id]` and array parameters for speed.
+6. **Native package.** To make it easy to install and as fast as possible, the
+   gateway became a native `.ipk` for the PTXdist firmware (version 1.1.x),
+   and the Docker files were removed.
+
+### 6.2 Source structure
+
+The program is plain C (gnu11), about 2600 lines, no dependencies besides
+glibc. Two threads matter: the KBUS cycle thread (`gateway.c`) and the REST
+server thread (`http_server.c` + `wda.c`). They share only the process images
+and channel values, behind one mutex with priority inheritance.
+
+| File | Role |
+|---|---|
+| `src/main.c` | startup order, signals, memory locking (`mlockall`) |
+| `src/config.c/.h` | environment variables → `gw_config_t` |
+| `src/backend_adi.c` | real KBUS: `dlopen` of `libdal`, ADI device scan, KBUS-info, cycle |
+| `src/backend_sim.c` | simulated node (12 DI, 8 DO, 4 AI, 4 AO; DI1–8 follow DO1–8, AI4 follows AO1) |
+| `src/gateway.c/.h` | channel map, process images, real-time cycle thread, bulk read/write under one lock |
+| `src/http_server.c/.h` | socket handling, single-channel and bulk decoding, response writing |
+| `src/wda.c/.h` | wdx data layer: parameter table (built once), JSON:API output, minimal JSON reader for PATCH |
+| `src/log.c/.h` | stderr or syslog |
+
+### 6.3 The native package
+
+- **Toolchain.** `tools/build-ipk.sh` compiles inside WAGO's SDK builder image
+  (`pfc300-builder`, made by `make builder` in the firmware SDK), with the
+  firmware's own cross compiler (GCC 11.3, glibc 2.35). The binary needs at
+  most `GLIBC_2.34`, so it runs on the firmware without extra libraries.
+- **Format.** Exactly like the packages PTXdist builds (compared with
+  `bzip2_1.0.8_arm64.ipk` of the SDK): an `ar` archive with
+  `debian-binary` (`2.0`), `control.tar.gz` (`control`, `postinst`, `prerm`,
+  `conffiles`) and `data.tar.gz`, files owned by root, directories `755`.
+- **Dependencies.** `Depends: dal, libdbuskbuscommon`, the firmware packages
+  that provide the KBUS libraries.
+- **Service.** A BusyBox-compatible init script (`start-stop-daemon`) like the
+  firmware's own scripts; `postinst` creates `/etc/rc.d/S99_kbus-gateway` and
+  starts it; `prerm` stops it before an update or removal.
+- **Settings** in `/etc/kbus-gateway.conf`, declared as conffile: opkg keeps a
+  changed file on updates.
+
+### 6.4 Problems solved on the way
+
+| Problem | Cause | Fix |
+|---|---|---|
+| `RTLD_DEFAULT undeclared` with the WAGO toolchain | older glibc headers need `_GNU_SOURCE` | `#define _GNU_SOURCE` in `backend_adi.c` |
+| `LOG_INFO redefined` | `<syslog.h>` defines `LOG_INFO` too | syslog code in its own file `log.c` |
+| own log lines appeared as `kbus:` | WAGO's KBUS library calls `openlog("kbus")` during initialisation | the gateway sets its own ident again for every message |
+| log flooded (14+ lines/s) | every cyclic write from CODESYS was logged | `HTTP_LOG=1` logs only writes that change an output |
+| `opkg`: `Removing obsolete file .` / unlink error on upgrade | the archives contained the root entry `./` | archives contain `./usr`, `./etc` ... only |
+| `sleep: invalid number '0.5'` | BusyBox `sleep` takes whole seconds | init script waits in steps of 1 s |
+| wdx id lookup slow | ids were formatted for every request | id table built once at startup |
+
+---
+
+## 7. Modifying the application
+
+### 7.1 Project layout
 
 ```
-├── Dockerfile                 buildx multi-platform build (cross-compile + slim runtime)
-├── Makefile                   native / cross build; enables the ADI backend when sdk/include exists
-├── src/
-│   ├── main.c                 startup, signals, wiring
-│   ├── config.c/.h            environment variables → gw_config_t
-│   ├── backend.h              backend interface (open / exchange / close)
-│   ├── backend_adi.c          real KBUS via WAGO ADI/DAL + KBUS-info (dlopen)
-│   ├── backend_sim.c          simulated node for testing
-│   ├── gateway.c/.h           channel map, process images, real-time cycle thread
-│   ├── http_server.c/.h       REST server (request decoding, responses)
-│   └── log.h
-├── docker/entrypoint.sh       container start: firmware libraries without the firmware's glibc
-├── sdk/                       WAGO SDK headers (see 2.2 and sdk/README.md)
+├── Makefile                   native / cross build; ADI backend when sdk/include/dal exists
+├── VERSION                    package version
+├── src/                       the program (6.2)
+├── packaging/ipk/             init script, config file, opkg control scripts
+├── sdk/                       SDK headers (imported, 2.3) + OsCommon.h stand-in
 ├── tools/
-│   ├── import-sdk-packages.sh headers from the prebuilt SDK packages (2.2 A)
-│   ├── import-sdk-headers.sh  headers from a built SDK sysroot (2.2 B)
-│   ├── deploy.sh              build, save archive, copy, load and (re)start (2.3-2.6)
-│   └── test-rest.py           reference-behaviour test (2.8)
-└── Information/               original WAGO example and ADI/DAL documentation
+│   ├── build-ipk.sh           build the .ipk with the SDK toolchain (2.4)
+│   ├── deploy.sh              build + copy + opkg install + status
+│   ├── import-sdk-packages.sh headers from the prebuilt SDK packages (2.3 A)
+│   ├── import-sdk-headers.sh  headers from a built SDK sysroot (2.3 B)
+│   └── test-rest.py           tests: reference, bulk, wdx, real node
+├── codesys-wdx/               CODESYS application via the wdx data layer (ST + brief)
+├── codesys/                   CODESYS project of the REST client tests
+└── Information/               WAGO example (MIT) and documentation
 ```
 
-### 5.2 Development loop
+### 7.2 Development loop (on the PC, no PFC needed)
 
 ```bash
-make run-sim                    # build natively + run in simulation on http://localhost:8000
-make clean
+make run-sim                                   # native build, simulated node on http://localhost:8000
+tools/test-rest.py 127.0.0.1 sim               # 31 reference cases + special cases
+tools/test-rest.py 127.0.0.1 bulk              # bulk requests
+tools/test-rest.py 127.0.0.1 wda               # wdx data layer (incl. PATCH and error codes)
+tools/deploy.sh 192.168.1.17                   # then: build .ipk, install on the PFC, status
 ```
 
-The VS Code tasks (*Terminal → Run Task*) cover the same steps: native build,
-simulation, buildx images and deploy.
+The VS Code tasks (*Terminal → Run Task*) cover the same steps. Without
+`sdk/include/dal` the native build is simulation-only, which is enough for
+all HTTP and channel-map work.
 
-The native build only compiles the ADI backend when `sdk/include` exists.
-Without the SDK it is simulation-only. That is enough for all REST and
-channel-map work.
+### 7.3 Common changes
 
-### 5.3 Common changes
+**Change the single-channel interface.** `decode_single()` in
+[src/http_server.c](src/http_server.c) is deliberately a byte-for-byte copy
+of the CODESYS reference; any change makes the gateway differ from it.
 
-**Change the REST interface.** Requests are decoded in `decode()` in
-[src/http_server.c](src/http_server.c). It is deliberately a byte-for-byte
-copy of the CODESYS reference; any change makes the gateway differ from it.
-Read and write channels only through the `gateway_*` functions; they take
-care of locking.
+**Change the wdx data layer.** The parameter tree is built in `build_list()`
+in [src/wda.c](src/wda.c); paths in `path_of()`, types in `dtype_of()`,
+values in `write_value()`. Ids follow automatically from the paths.
 
 **Support another module type.** Module classification is in
-`build_channel_map()` in [src/gateway.c](src/gateway.c). For example, an analog
-module with status bytes can get its own branch that skips the status byte and
-calls `add_channel()` with the correct bit offset per channel.
+`build_channel_map()` in [src/gateway.c](src/gateway.c).
 
-**Change the simulated node.** Edit the `node[]` table and `sim_exchange()` in
-[src/backend_sim.c](src/backend_sim.c). Offsets are absolute bit offsets:
-analog data first, digital data behind it.
+**Release.** Raise [VERSION](VERSION), `tools/build-ipk.sh arm64`, install.
 
-**Add another bus / fieldbus backend.** Implement the three functions of
-`kbus_backend_t` ([src/backend.h](src/backend.h)) and select it in `main.c`.
-
-### 5.4 Rules to keep
+### 7.4 Rules to keep
 
 - Never do slow work (I/O, logging, allocation) in `cycle_thread()`. Every
   cycle must finish well within 50 ms, or the output modules switch off.
-- Keep `KBUS_CYCLE_MS` < 50. The default of 10 ms leaves plenty of margin.
+- Keep `HTTP_PRIORITY` below `KBUS_PRIORITY`.
+- Read and write channels only through the `gateway_*` functions; they take
+  care of locking.
 - Build against headers with the **same DAL version** as the PFC's
-  `libdal.so` (2.2). The ADI interface table is version-specific.
-- The runtime image glibc (Debian trixie) must be **at least as new** as the
-  firmware's glibc, because the firmware libraries are loaded into the
-  container's process. After a big firmware upgrade, check the startup log.
+  `libdal.so` (2.3). The ADI interface table is version-specific.
+- Build with the toolchain of the controller's firmware SDK, so the binary
+  does not need a newer glibc than the firmware has.
 
 ---
 
-## 6. Troubleshooting
+## 8. Troubleshooting
 
-The first five rows are the errors met, in this order, during the first
-start on the PFC200; the run command in 2.6 contains all fixes.
-
-| Symptom (in `docker logs kbus-gateway`) | Cause / fix |
+| Symptom | Cause / fix |
 |---|---|
-| `symbol lookup error: /host/usr/lib/libc.so.6: undefined symbol: __nptl_set_robust_list_avail` | `-e LD_LIBRARY_PATH=/host/usr/lib` is set: the firmware's glibc is loaded by the container's loader. Remove it; the entrypoint sets the library path |
-| `ERROR: IsRegularFile(): stat() failed` + `ADI device scan failed` | The DAL plugins in `/usr/lib/dal` are not found. Do not mount `/usr/lib/dal` separately; use an image with [docker/entrypoint.sh](docker/entrypoint.sh) |
-| `get_typelabel_value: not found` / `/dev/eeprom` + `opening the KBUS device failed` | Mount `get_typelabel_value` and `/dev/eeprom` (2.6). Also check that no PLC application owns the KBUS |
-| `failed to load "/etc/specific/kbusconf.xml"` | Mount `/etc/specific:ro` |
-| `process image larger than ... bytes` | Image built from an older version of the source; rebuild |
-| Syslog: `SCPU_boot_slave: Cannot open devices` | Mount `/dev/ttyKbus` |
-| `opening the KBUS device failed` (with all mounts) | A PLC application still owns the KBUS. Stop it (2.4) |
-| `could not load the ADI/DAL library` | `/usr/lib` not mounted at `/host/usr/lib`. Check the library name on the PFC (`ls /usr/lib/libdal*`) and set `KBUS_DAL_LIB` |
-| `version 'GLIBC_2.xx' not found` | The firmware is newer than the image's glibc: raise `DEBIAN_RELEASE` in the Dockerfile |
-| `this binary was built WITHOUT the WAGO ADI/DAL headers` | Image built with `REQUIRE_ADI=0` or without `sdk/include`. Import the headers (2.2) and rebuild |
-| Build: `WAGO SDK headers not found in sdk/include` | Import the headers (2.2) |
-| `cannot listen on port ...: Address in use (retrying)` | The port is used by something else (e.g. a CODESYS application on 8000, or the WBM on 80/443). Choose another `HTTP_PORT` |
-| `ldkc_KbusInfo_Create failed` | D-Bus socket not mounted (`-v /var/run/dbus:/var/run/dbus`) |
-| `real-time scheduling not permitted` | The container is not `--privileged`. Outputs may drop out under load |
-| Channel numbers point to the wrong I/O | Compare the startup module list with the node. Try `KBUS_DIGITAL_OFFSET_MODE=relative` or `absolute` |
-| Outputs drop out briefly | Check the log for `KBUS cycle failing`; lower system load or the cycle time |
-| Test: some special cases time out from the PC, pass on the PFC | Something on the network path holds back incomplete HTTP requests (2.8); not a gateway fault |
-| Container status `Restarting` | `docker logs kbus-gateway` shows the reason; stop the loop with `docker rm -f kbus-gateway` while investigating |
+| `opening the KBUS device failed` | another program owns the KBUS: firmware runtime not *None*, a CODESYS project with KBUS, or a second gateway (e.g. an old Docker container) |
+| `cannot listen on port 8000: Address in use (retrying)` | something else uses the port (a second gateway, a CODESYS application); choose another `HTTP_PORT` |
+| `could not load the ADI/DAL library` | check `ls /usr/lib/libdal*` and set `KBUS_DAL_LIB` |
+| `this binary was built WITHOUT the WAGO ADI/DAL headers` | built without `sdk/include/dal`: import the headers (2.3) and rebuild |
+| `version 'GLIBC_2.xx' not found` | built with a newer toolchain than the firmware: use the SDK builder image of the firmware |
+| `opkg`: dependency `dal` / `libdbuskbuscommon` missing | firmware without KBUS support (not a PFC with KBUS) |
+| `real-time scheduling not permitted` | not started as root; use the init script |
+| `ldkc_KbusInfo_Create failed` | D-Bus not running yet; start later or check `/run/dbus/system_bus_socket` |
+| Channel numbers point to the wrong I/O | compare the startup module list with the node; try `KBUS_DIGITAL_OFFSET_MODE=relative` or `absolute` |
+| Outputs drop out briefly | look for `KBUS cycle failing` in the log; lower system load or the cycle time |
+| Requests take ~10 ms now and then | CODESYS real-time threads (section 5); not a gateway fault |
 
-**Investigating further.** The PFC has `strace`; mount it into the container
-to see which files the WAGO libraries miss (this found the mounts in 2.6):
-
-```bash
-ssh root@192.168.1.17 'docker rm -f kbus-gateway; docker run --rm --privileged --network host \
-  -v /usr/lib:/host/usr/lib:ro -v /var/run/dbus:/var/run/dbus -v /etc/specific:/etc/specific:ro \
-  -v /etc/config-tools/get_typelabel_value:/etc/config-tools/get_typelabel_value:ro \
-  -v /dev/eeprom:/dev/eeprom -v /dev/ttyKbus:/dev/ttyKbus -v /dev/log:/dev/log \
-  -v /usr/bin/strace:/strace:ro --entrypoint /bin/sh kbus-gateway:latest -c \
-  "sed -i \"s#^exec #exec /strace -f -e trace=%file -e status=failed #\" /usr/local/bin/entrypoint.sh; \
-   timeout 20 /usr/local/bin/entrypoint.sh" 2>&1 | grep -v host-libs | tail -40'
-```
-
-Library names, mount paths and the digital-offset interpretation can differ
-between firmware releases. The startup log shows which choice was made, and
-the variables in section 4 override it.
+**Investigating further.** The PFC has `strace`:
+`strace -f -e trace=%file -e status=failed /usr/bin/kbus-gateway` (stop the
+service first) shows which files the WAGO libraries miss. Library names and
+the digital-offset interpretation can differ between firmware releases; the
+startup log shows which choice was made, and the variables in section 4
+override it.
 
 ---
 
-## 7. Limitations and security
+## 9. Limitations and security
 
 - Only plain digital modules and plain analog modules (16-bit words, data in
   one direction) are mapped. Complex modules and the 750-495 get no channels.
 - Values are raw process-image values; there is no unit scaling.
-- The module list is read once at startup. Restart the container after
-  changing the node.
+- The module list is read once at startup: run
+  `/etc/init.d/kbus-gateway restart` after changing the node.
 - **Only one KBUS master**: the gateway and a CODESYS application with KBUS
   access cannot run at the same time.
-- Tested on real hardware with digital outputs only (one 8DO module). Digital
-  inputs, analog modules and the 750-495 were tested with the simulation node.
-- Not yet tested on a PFC300 or PFC100 (2.10); the arm64 image builds cleanly.
-- Not yet tested: the first start after a power cycle with runtime **None**,
-  where the gateway has to load the KBUS controller firmware itself
-  (`/dev/ttyKbus`).
-- **The REST interface is unencrypted and has no authentication**, exactly as
-  the CODESYS reference. Anyone who can reach the port can read all I/O and
+- Tested on real hardware with digital outputs only (one 8DO module, PFC300
+  and PFC200). Digital inputs, analog modules and the 750-495 were tested with
+  the simulation node. The `armhf` package for PFC100/PFC200 builds but has
+  not been installed yet.
+- **All interfaces are unencrypted and have no authentication**, exactly as
+  the CODESYS reference. Anyone who can reach port 8000 can read all I/O and
   switch outputs. Use it only on an isolated machine network, set
-  `HTTP_WRITE_ENABLE=0` when writing is not needed, and put a TLS reverse
-  proxy in front when it must be reachable more widely.
-- On `docker stop` all outputs are switched to 0. If the container crashes,
-  the output modules switch off on their own after 50 ms without a KBUS cycle.
+  `HTTP_WRITE_ENABLE=0` when writing is not needed, and block the port in the
+  PFC firewall for other networks.
+- On `stop` and `opkg remove` all outputs are switched to 0. If the program
+  crashes, the output modules switch off on their own after 50 ms.

@@ -33,6 +33,7 @@ void config_load(gw_config_t *cfg)
     cfg->http_enable    = env_int("HTTP_ENABLE", 1, 0, 1);
     cfg->http_write_enable = env_int("HTTP_WRITE_ENABLE", 1, 0, 1);
     cfg->http_log       = env_int("HTTP_LOG", 1, 0, 2);
+    cfg->http_priority  = env_int("HTTP_PRIORITY", 0, 0, 99);
     cfg->cycle_ms       = env_int("KBUS_CYCLE_MS", 10, 1, 40);
     cfg->rt_priority    = env_int("KBUS_PRIORITY", 40, 0, 99);
     cfg->simulation     = env_int("KBUS_SIMULATION", 0, 0, 1);
@@ -46,9 +47,12 @@ void config_load(gw_config_t *cfg)
 void config_log(const gw_config_t *cfg)
 {
     static const char *const log_names[] = { "none", "writes", "all" };
-    LOG_INFO("config: rest=%s port=%d writes=%s log=%s cycle=%dms rt-prio=%d mode=%s",
+    LOG_INFO("config: rest=%s port=%d writes=%s log=%s http-prio=%d cycle=%dms rt-prio=%d mode=%s",
              cfg->http_enable ? "on" : "off", cfg->http_port,
              cfg->http_write_enable ? "allowed" : "disabled", log_names[cfg->http_log],
-             cfg->cycle_ms, cfg->rt_priority,
+             cfg->http_priority, cfg->cycle_ms, cfg->rt_priority,
              cfg->simulation ? "SIMULATION" : "kbus");
+    if (cfg->http_priority > 0 && cfg->rt_priority > 0 && cfg->http_priority >= cfg->rt_priority)
+        LOG_WARN("HTTP_PRIORITY %d is not below KBUS_PRIORITY %d: requests may delay the KBUS cycle",
+                 cfg->http_priority, cfg->rt_priority);
 }

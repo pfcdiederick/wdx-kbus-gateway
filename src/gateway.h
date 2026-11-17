@@ -53,6 +53,8 @@ int                 gateway_write(io_kind_t kind, size_t number, int64_t value);
 // Bulk access (REST /DI /DO /AI /AO /ALL): one lock for all channels.
 void gateway_snapshot(uint16_t out[IO_KIND_COUNT][GW_MAX_CHANNELS]);
 int  gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT]);
+// 1 when the last gateway_write / gateway_write_multi changed an output value.
+int  gateway_write_changed(void);
 
 const kbus_module_t *gateway_modules(size_t *count);
 void                 gateway_module_name(const kbus_module_t *m, char *buf, size_t len);

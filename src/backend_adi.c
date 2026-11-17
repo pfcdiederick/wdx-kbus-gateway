@@ -6,9 +6,10 @@
 //                     triggered with "libpackbus_Push"
 //
 // The WAGO libraries are NOT linked at build time. They are dlopen()'ed at
-// runtime from the controller's firmware (bind-mounted into the container),
-// so the image always uses the libraries that match the PFC firmware and the
-// build only needs the SDK headers.
+// runtime from the controller's firmware (/usr/lib), so the gateway always
+// uses the libraries that match the installed firmware and the build only
+// needs the SDK headers.
+#define _GNU_SOURCE  // RTLD_DEFAULT (needed with the glibc 2.35 of the WAGO toolchain)
 #include "backend.h"
 #include "log.h"
 

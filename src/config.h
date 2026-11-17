@@ -7,6 +7,7 @@ typedef struct {
     int         http_enable;        // HTTP_ENABLE        (default 1): REST server on/off
     int         http_write_enable;  // HTTP_WRITE_ENABLE  (default 1): 0 = POST answers 403
     int         http_log;           // HTTP_LOG           (default 1): 0 none, 1 writes, 2 every request
+    int         http_priority;      // HTTP_PRIORITY      (default 0): SCHED_FIFO priority of the REST server, 0 = normal
     int         cycle_ms;        // KBUS_CYCLE_MS    (default 10, must stay well below 50 ms)
     int         rt_priority;     // KBUS_PRIORITY    (default 40, SCHED_FIFO; 0 = no real-time)
     int         simulation;      // KBUS_SIMULATION  (default 0): simulated I/O, no hardware

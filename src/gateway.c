@@ -368,8 +368,14 @@ int gateway_read(io_kind_t kind, size_t number, int64_t *value)
     return GW_OK;
 }
 
+// Did the last gateway_write / gateway_write_multi change any output value?
+// (Only used by the single-threaded REST server, to log real changes only.)
+static int last_write_changed;
+int gateway_write_changed(void) { return last_write_changed; }
+
 int gateway_write(io_kind_t kind, size_t number, int64_t value)
 {
+    last_write_changed = 0;
     if (!io_kind_writable(kind))
         return GW_EREADONLY;
     if (number == 0 || number > gw.ch_count[kind])
@@ -380,6 +386,7 @@ int gateway_write(io_kind_t kind, size_t number, int64_t value)
         return GW_ERANGE;
 
     pthread_mutex_lock(&gw.lock);
+    last_write_changed = (ch->value != (uint16_t)value);
     ch->value = (uint16_t)value;
     if (ch->mapped)
         bits_set(gw.out, ch->bit_offset, ch->bit_width, (uint32_t)value);
@@ -410,6 +417,7 @@ void gateway_snapshot(uint16_t out[IO_KIND_COUNT][GW_MAX_CHANNELS])
 // cycle sends them together. Nothing is written when one value is invalid.
 int gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT])
 {
+    last_write_changed = 0;
     for (int k = 0; k < IO_KIND_COUNT; ++k) {
         if (n[k] == 0)
             continue;
@@ -429,6 +437,8 @@ int gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n
             if (vals[k][i] < 0)
                 continue;
             io_channel_t *ch = &gw.ch[k][i];
+            if (ch->value != (uint16_t)vals[k][i])
+                last_write_changed = 1;
             ch->value = (uint16_t)vals[k][i];
             if (ch->mapped)
                 bits_set(gw.out, ch->bit_offset, ch->bit_width, (uint32_t)vals[k][i]);

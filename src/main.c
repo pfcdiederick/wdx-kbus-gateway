@@ -1,8 +1,10 @@
 // WAGO KBUS HTTP gateway
 //
 // Reads and writes the DI / DO / AI / AO channels of the I/O modules on the
-// KBUS of a WAGO PFC100/PFC200 through the ADI/DAL interface, and serves them
-// over a REST interface, e.g. GET http://<pfc-ip>:8000/DI/1 -> "DI1=TRUE".
+// KBUS of a WAGO PFC100/PFC200/PFC300 through the ADI/DAL interface, and
+// serves them over HTTP: single channels (GET /DI/1 -> "DI1=TRUE"), bulk
+// (/ALL) and a wdx-style data layer (/wda/parameters, JSON:API).
+// Runs natively on the PTXdist firmware (opkg package, tools/build-ipk.sh).
 #include "backend.h"
 #include "config.h"
 #include "gateway.h"
@@ -26,6 +28,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    log_init();
     LOG_INFO("WAGO KBUS HTTP gateway starting");
 
     gw_config_t cfg;

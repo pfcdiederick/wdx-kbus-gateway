@@ -8,6 +8,8 @@ Every response is compared byte for byte with what the reference sends.
                                            (KBUS_SIMULATION=1), writes outputs
   tools/test-rest.py <host> bulk           bulk extension (/DO /AO /ALL, README
                                            3.4) on the SIMULATION node, writes
+  tools/test-rest.py <host> wda            wdx-style interface (/wda/parameters,
+                                           JSON:API) on the SIMULATION node, writes
   tools/test-rest.py <host> node           real node, read only: finds the
                                            channel counts, checks reads and
                                            invalid requests, writes NOTHING
@@ -294,17 +296,114 @@ def mode_bulk():
     post("/ALL", "DO=00000000;AO=0,0,0,0")
 
 
+def wda_req(method, path, body=None, ctype="application/vnd.api+json"):
+    """Return (status, parsed JSON or None) for the wdx-style interface."""
+    import json
+    head = f"{method} {path} HTTP/1.1\r\nHost: x\r\n"
+    if body is not None:
+        data = json.dumps(body) if not isinstance(body, str) else body
+        head += (f"Content-Type: {ctype}\r\n" if ctype else "") + f"Content-Length: {len(data)}\r\n\r\n" + data
+    else:
+        head += "\r\n"
+    r = raw(head)
+    status = int(r.split(" ", 2)[1]) if r.startswith("HTTP/1.0 ") else 0
+    payload = r.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in r else ""
+    try:
+        return status, json.loads(payload) if payload else None
+    except ValueError:
+        return status, None
+
+
+def wcheck(name, got, ok, note=""):
+    global failures
+    failures += not ok
+    print(f"{'PASS' if ok else 'FAIL'} {name:>6}  {str(got)[:90]}  {note}", flush=True)
+
+
+def patch_body(pid, value, typ="parameters"):
+    return {"data": {"type": typ, "id": pid, "attributes": {"value": value}}}
+
+
+def mode_wda():
+    """wdx-style interface on the SIMULATION node (12 DI, 8 DO, 4 AI, 4 AO)."""
+    P = "/wda/parameters"
+    do3 = "0-0-kbus-digitaloutputs-3-value"
+    ao2 = "0-0-kbus-analogoutputs-2-value"
+    st, d = wda_req("GET", P)
+    ids = [x["id"] for x in d["data"]] if d else []
+    wcheck("w1", (st, len(ids)), st == 200 and len(ids) == d["meta"]["total"] and len(set(ids)) == len(ids),
+           "all parameters, unique ids")
+    paths = {x["id"]: x["attributes"]["path"] for x in d["data"]} if d else {}
+    rule = all(i == "0-0-" + p.lower().replace("/", "-") for i, p in paths.items())
+    wcheck("w2", "id = 0-0- + lower(path) with / -> -", rule)
+    st, d = wda_req("GET", P + "?page[limit]=3&page[offset]=2")
+    wcheck("w3", (st, [x["id"] for x in d["data"]] if d else None),
+           st == 200 and len(d["data"]) == 3 and d["data"][0]["id"] == "0-0-kbus-cyclecount", "paging")
+    st, d = wda_req("GET", P + "?page%5Blimit%5D=1")
+    wcheck("w4", st, st == 200 and len(d["data"]) == 1, "URL-encoded page[limit]")
+    want = ["0-0-kbus-digitalinputvalues", "0-0-kbus-analoginputvalues", "0-0-kbus-digitaloutputvalues"]
+    st, d = wda_req("GET", P + "?filter[id]=" + ",".join(want))
+    got = [x["id"] for x in d["data"]] if d else []
+    wcheck("w4b", got, st == 200 and sorted(got) == sorted(want), "filter[id], one GET")
+    st, d = wda_req("GET", P + "?filter%5Bid%5D=" + "%2C".join(want[:2]))
+    wcheck("w4c", st, st == 200 and len(d["data"]) == 2, "URL-encoded filter")
+    st, d = wda_req("GET", P + "/0-0-kbus-modules")
+    wcheck("w5", d, st == 200 and d["data"]["attributes"]["dataType"] == "instantiations")
+    st, d = wda_req("GET", P + f"/{do3}/definition")
+    wcheck("w6", d, st == 200 and d["data"]["attributes"]["writeable"] is True)
+    st, d = wda_req("GET", P + "/0-0-kbus-digitalinputs-1-value/definition")
+    wcheck("w7", d, st == 200 and d["data"]["attributes"]["writeable"] is False)
+    # PATCH scalar
+    st, _ = wda_req("PATCH", P + f"/{do3}", patch_body(do3, True))
+    wcheck("w8", st, st == 204, "PATCH DO3 true")
+    st, d = wda_req("GET", P + f"/{do3}")
+    wcheck("w9", d, st == 200 and d["data"]["attributes"]["value"] is True)
+    st, _ = wda_req("PATCH", P + f"/{ao2}", patch_body(ao2, 12345))
+    st2, d = wda_req("GET", P + f"/{ao2}")
+    wcheck("w10", (st, d["data"]["attributes"]["value"] if d else None), st == 204 and d["data"]["attributes"]["value"] == 12345)
+    # PATCH array
+    arr = "0-0-kbus-digitaloutputvalues"
+    st, _ = wda_req("PATCH", P + f"/{arr}", patch_body(arr, [True, False, True]))
+    st2, d = wda_req("GET", P + f"/{arr}")
+    wcheck("w11", d["data"]["attributes"]["value"] if d else None,
+           st == 204 and d["data"]["attributes"]["value"][:3] == [True, False, True], "array, first 3 channels")
+    # errors
+    for name, args_, exp in [
+        ("e1", ("PATCH", P + f"/{do3}", patch_body(do3, True), "text/plain"), 415),
+        ("e2", ("PATCH", P + f"/{do3}", patch_body(do3, True), None), 415),
+        ("e3", ("PATCH", P + f"/{do3}", "{not json"), 400),
+        ("e4", ("PATCH", P + f"/{do3}", patch_body("0-0-kbus-digitaloutputs-4-value", True)), 400),
+        ("e5", ("PATCH", P + f"/{do3}", patch_body(do3, True, "foo")), 400),
+        ("e6", ("PATCH", P + f"/{do3}", patch_body(do3, 1)), 400),
+        ("e7", ("PATCH", P + f"/{ao2}", patch_body(ao2, 70000)), 409),
+        ("e8", ("PATCH", P + f"/{ao2}", patch_body(ao2, -1)), 409),
+        ("e9", ("PATCH", P + "/0-0-kbus-digitalinputs-1-value",
+                patch_body("0-0-kbus-digitalinputs-1-value", True)), 409),
+        ("e10", ("PATCH", P + f"/{arr}", patch_body(arr, [True] * 9)), 409),
+        ("e11", ("PATCH", P, patch_body(do3, True)), 405),
+        ("e12", ("GET", P + "/0-0-kbus-nothing"), 404),
+        ("e13", ("GET", "/wda/other"), 404),
+    ]:
+        st, d = wda_req(*args_)
+        wcheck(name, st, st == exp and d is not None and "errors" in d, f"expected {exp}")
+    st, d = wda_req("GET", P + f"/{do3}")
+    wcheck("e14", d, d["data"]["attributes"]["value"] is True, "unchanged after rejected writes")
+    # the old interface still works next to it
+    check("e15", get("/DO/3"), OK("DO3=TRUE"), note="single-channel API unchanged")
+    post("/ALL", "DO=00000000;AO=0,0,0,0")
+
+
 def main():
     global args
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("host")
-    p.add_argument("mode", choices=["sim", "bulk", "node", "write", "forbidden"])
+    p.add_argument("mode", choices=["sim", "bulk", "wda", "node", "write", "forbidden"])
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--do", type=int, help="write mode: DO channel to switch")
     p.add_argument("--ao", type=int, help="write mode: AO channel to write")
     p.add_argument("--pause", type=float, default=3.0, help="write mode: seconds between steps")
     args = p.parse_args()
-    {"sim": mode_sim, "bulk": mode_bulk, "node": mode_node, "write": mode_write,
+    {"sim": mode_sim, "bulk": mode_bulk, "wda": mode_wda, "node": mode_node, "write": mode_write,
      "forbidden": mode_forbidden}[args.mode]()
     print(f"\nFAILURES: {failures}")
     sys.exit(1 if failures else 0)

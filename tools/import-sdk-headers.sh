@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copy the WAGO ADI/DAL + KBUS-info headers from a built WAGO PFC SDK (ptxproj)
-# into ./sdk, so that the Docker build can compile the real KBUS backend.
+# into ./sdk, so that tools/build-ipk.sh can compile the real KBUS backend.
 #
 #   tools/import-sdk-headers.sh <path-to-ptxproj> [platform-dir]
 #

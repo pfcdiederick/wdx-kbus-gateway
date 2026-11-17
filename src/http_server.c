@@ -34,9 +34,12 @@
 #include "http_server.h"
 #include "gateway.h"
 #include "log.h"
+#include "wda.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -174,7 +177,7 @@ static int decode_single(const char *buf, size_t len, int post, size_t pos,
         }
         if (gateway_write(kind, (size_t)n, v) != GW_OK)
             return 404;
-        if (cfg->http_log >= 1)
+        if (cfg->http_log >= 2 || (cfg->http_log >= 1 && gateway_write_changed()))
             LOG_INFO("write %s%d = %lld", io_kind_name(kind), (int)n, (long long)v);
     }
 
@@ -344,7 +347,7 @@ static int decode_bulk(const char *buf, size_t len, int post, size_t pos,
         }
         if (gateway_write_multi(vals, n) != GW_OK)
             return 1;
-        if (cfg->http_log >= 1)
+        if (cfg->http_log >= 2 || (cfg->http_log >= 1 && gateway_write_changed()))
             LOG_INFO("write %s%.*s", all ? "" : (kind == IO_DO ? "DO=" : "AO="), (int)blen, body);
     }
 
@@ -431,6 +434,66 @@ static int wait_fd(int fd, short events, volatile sig_atomic_t *stop)
     return -1;
 }
 
+static int send_all(int cfd, const char *p, size_t len, volatile sig_atomic_t *stop)
+{
+    size_t sent = 0;
+    while (sent < len) {
+        const ssize_t s = send(cfd, p + sent, len - sent, MSG_NOSIGNAL);
+        if (s > 0) {
+            sent += (size_t)s;
+        } else if (s < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (wait_fd(cfd, POLLOUT, stop) != 0)
+                return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static const char *reason_of(int status)
+{
+    switch (status) {
+    case 200: return "OK";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 409: return "Conflict";
+    case 415: return "Unsupported Media Type";
+    default:  return "Error";
+    }
+}
+
+// wdx-style interface: JSON:API answer with Content-Length.
+static void serve_wda(int cfd, const char *rx, size_t n, const char *peer,
+                      const gw_config_t *cfg, volatile sig_atomic_t *stop)
+{
+    wbuf_t body = { NULL, 0, 0 };
+    const int status = wda_handle(rx, n, cfg, &body);
+    if (cfg->http_log >= 2) {
+        size_t rl = 0;
+        while (rl < n && rl < 100 && rx[rl] != '\r' && rx[rl] != '\n')
+            rl++;
+        LOG_INFO("%s \"%.*s\" -> %d %.*s", peer, (int)rl, rx, status,
+                 (int)(body.len > 120 ? 120 : body.len), body.data ? body.data : "");
+    }
+    char head[192];
+    int hl;
+    if (body.len > 0)
+        hl = snprintf(head, sizeof(head),
+                      "HTTP/1.0 %d %s\r\nContent-Type: application/vnd.api+json\r\n"
+                      "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                      status, reason_of(status), body.len);
+    else
+        hl = snprintf(head, sizeof(head), "HTTP/1.0 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                      status, reason_of(status));
+    if (send_all(cfd, head, (size_t)hl, stop) == 0 && body.len > 0)
+        send_all(cfd, body.data, body.len, stop);
+    wbuf_free(&body);
+}
+
 static void serve_client(int cfd, const char *peer, const gw_config_t *cfg, volatile sig_atomic_t *stop)
 {
     // Receive: ONE read.
@@ -446,6 +509,11 @@ static void serve_client(int cfd, const char *peer, const gw_config_t *cfg, vola
     }
     if (n <= 0)
         return;   // closed by the client or error: close without a response
+
+    if (wda_match(rx, (size_t)n)) {
+        serve_wda(cfd, rx, (size_t)n, peer, cfg, stop);
+        return;
+    }
 
     static char body[OUT_MAX];
     const int status = decode(rx, (size_t)n, cfg, body, sizeof(body));
@@ -489,6 +557,21 @@ int http_server_run(const gw_config_t *cfg, volatile sig_atomic_t *stop)
         while (!*stop)
             pause();
         return 0;
+    }
+
+    wda_init();          // parameter/id tables of the wdx-style interface, built once
+
+    // Real-time priority for the REST server thread (this thread only; the KBUS
+    // cycle and the WAGO library threads already exist and keep their own).
+    // Keeps request latency short when the CODESYS runtime loads the CPU.
+    if (cfg->http_priority > 0) {
+        struct sched_param sp = { .sched_priority = cfg->http_priority };
+        const int r = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+        if (r == 0)
+            LOG_INFO("REST server thread: SCHED_FIFO priority %d", cfg->http_priority);
+        else
+            LOG_WARN("HTTP_PRIORITY %d not applied: %s (needs root / CAP_SYS_NICE)",
+                     cfg->http_priority, strerror(r));
     }
 
     int lfd = -1;

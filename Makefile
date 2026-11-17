@@ -1,7 +1,7 @@
 # KBUS HTTP gateway
 #
 #   make                      native build (simulation only, unless sdk/include exists)
-#   make CC=arm-linux-gnueabihf-gcc REQUIRE_ADI=1   PFC build (done by the Dockerfile)
+#   make CC=aarch64-linux-gnu-gcc REQUIRE_ADI=1     PFC build (done by tools/build-ipk.sh)
 #
 # The WAGO ADI/DAL backend is compiled when the SDK headers are present in
 # $(SDK)/include (see tools/import-sdk-headers.sh). The WAGO libraries are not
@@ -19,7 +19,7 @@ GW_CFLAGS  := -std=gnu11 -Wall -Wextra -pthread
 GW_LDFLAGS := -pthread
 GW_LDLIBS  := -ldl
 
-SRCS := src/main.c src/config.c src/gateway.c src/http_server.c \
+SRCS := src/main.c src/log.c src/config.c src/gateway.c src/http_server.c src/wda.c \
         src/backend_sim.c src/backend_adi.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 
