@@ -47,4 +47,6 @@ echo ">>> 3/3 status"
 # shellcheck disable=SC2016
 $SSH 'sleep 3; /etc/init.d/kbus-gateway status; P=$(cat /var/run/kbus-gateway.pid 2>/dev/null);
       grep "kbus-gateway\[$P\]" /var/log/messages | tail -12'
-echo ">>> done. Test: curl -g 'http://$PFC:8000/wda/parameters?page[limit]=5'   or   tools/test-rest.py $PFC node"
+echo ">>> done. Test on the controller:"
+echo "    ssh $PFC_USER@$PFC \"curl -sg --unix-socket /run/kbus-gateway/wdx.sock 'http://x/wda/parameters?page[limit]=5'\""
+echo "    (from the PC, tests/test-rest.py $PFC node, needs HTTP_BIND=0.0.0.0, README 2.7)"

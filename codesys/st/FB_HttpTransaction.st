@@ -49,7 +49,7 @@ VAR
     iPrev         : INT;
     iLoop         : INT;
     abChunk       : ARRAY[0..1023] OF BYTE;
-    abRx          : ARRAY[0..4095] OF BYTE;
+    abRx          : ARRAY[0..8191] OF BYTE;              // 8 KB: a full WDA answer with stringValue and links
     udiRx         : UDINT;
     diHdrEnd      : DINT;                                // position of CR LF CR LF, -1 = not yet
     diCLen        : DINT;                                // Content-Length, -1 = none

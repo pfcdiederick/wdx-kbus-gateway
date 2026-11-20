@@ -229,7 +229,7 @@ IF iState > 0 THEN
             END_IF
             iExpected := -1;
         ELSE
-            // 400/409 = request rejected (e.g. more channels than the gateway has),
+            // 400 = request rejected (e.g. more channels than the gateway has),
             // 403 = writes disabled, 404 = old gateway without wdx, xError = network
             udiErrors := udiErrors + 1;
             uiErrStreak := uiErrStreak + 1;

@@ -1,0 +1,10 @@
+# Ignore file of docker/gateway/Dockerfile (build context = project root).
+# Keep the context small: only Makefile, VERSION, src/, web/, sdk/ and the entrypoint are needed.
+*
+!Makefile
+!VERSION
+!src/
+!web/
+!sdk/
+!docker/gateway/entrypoint.sh
+!docker/manager/kbus-dashboard-check.sh

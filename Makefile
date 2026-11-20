@@ -17,10 +17,12 @@ CFLAGS  ?= -O2 -g
 # Required flags live in separate variables so `make CFLAGS=...` cannot drop them.
 GW_CFLAGS  := -std=gnu11 -Wall -Wextra -pthread
 GW_LDFLAGS := -pthread
+GW_VERSION := $(shell tr -d ' \n' < VERSION 2>/dev/null)
+GW_CFLAGS  += -DGW_VERSION='"$(GW_VERSION)"'
 GW_LDLIBS  := -ldl
 
 SRCS := src/main.c src/log.c src/config.c src/gateway.c src/http_server.c src/wda.c \
-        src/backend_sim.c src/backend_adi.c
+        src/registers.c src/backend_sim.c src/backend_adi.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o) $(BUILD)/web_asset.o   # web page built into the binary
 
 ifneq ($(wildcard $(SDK)/include/dal/adi_application_interface.h),)
@@ -48,6 +50,8 @@ $(TARGET): $(OBJS)
 
 $(BUILD)/%.o: src/%.c src/*.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(GW_CFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/wda.o: $(wildcard VERSION)   # GET /wda reports the version
 
 # web/index.html is embedded with .incbin (path relative to the project root)
 $(BUILD)/web_asset.o: src/web_asset.S web/index.html | $(BUILD)

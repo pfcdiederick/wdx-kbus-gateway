@@ -1,4 +1,4 @@
-# Docker image archives (built by tools/deploy.sh; large, contain third-party binaries)
+# Docker image archives (large, contain third-party binaries)
 *.tar.gz
 
 # Build output
@@ -11,8 +11,9 @@ __pycache__/
 sdk/include/dal/
 sdk/include/ldkc_kbus_information.h
 
-# WAGO application note (download it from wago.com instead)
-Information/**/*.pdf
+# WAGO documents (download them from wago.com instead)
+docs/reference/**/*.pdf
+Information/
 
 # CODESYS: only the .project file is versioned
 codesys/*.opt
@@ -25,3 +26,6 @@ codesys/*.backup
 
 # Native packages (tools/build-ipk.sh)
 build-ipk/
+
+# Docker image archives (tools/deploy-docker.sh)
+build-docker/

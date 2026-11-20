@@ -7,7 +7,8 @@
 <!--
   Web page of the KBUS gateway, served at http://<pfc-ip>:8000/ .
   Built into the program (src/web_asset.S). Uses ONLY the wdx data layer:
-    - once:  GET /wda/parameters                          (tree: modules, channels)
+    - once:  GET /wda/parameters (+ links.next pages)     (tree: modules, channels; again when
+                                                           KBus/ConfigurationVersion changes)
     - live:  GET /wda/parameters?filter[id]=...           (status + all value arrays, one request)
     - write: PATCH /wda/parameters/0-0-kbus-...-value     (JSON:API body)
   No external files: works on a machine network without internet.
@@ -60,6 +61,9 @@
   td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 600; }
   .note { font-size: 13px; color: var(--muted); }
+  .hbtn { margin-left: auto; padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px;
+          background: var(--bg); color: var(--ink); font: inherit; font-size: 13px; cursor: pointer; }
+  .hbtn:hover { outline: 2px solid var(--accent); }
   #msg { min-height: 1.4em; font-size: 13px; }
   #msg.err { color: var(--bad); }
   code { font-size: 12px; }
@@ -74,6 +78,8 @@
   <span class="stat">cycle <b id="cycletime">–</b> ms</span>
   <span class="stat">cycles <b id="cycles">–</b></span>
   <span class="stat">errors <b id="errors">–</b></span>
+  <span class="stat">configuration <b id="config">–</b></span>
+  <button type="button" id="rescan" class="hbtn" title="Read the modules on the KBUS again (outputs go to 0 briefly)">Rescan KBus</button>
 </header>
 <main>
   <div id="msg"></div>
@@ -83,15 +89,15 @@
   <section id="sec-ao" class="hidden"><h2>Analog outputs <span class="note">(raw 0–65535)</span></h2><div id="ao" class="ana"></div></section>
   <section><h2>Modules</h2><table><thead><tr><th>#</th><th>Module</th><th>Type code</th><th>Channels</th></tr></thead><tbody id="mods"></tbody></table></section>
   <p class="note">
-    Live values through the wdx data layer: one <code>GET /wda/parameters?filter[id]=…</code> every
+    Live values through the WDX data layer: one <code>GET /wda/parameters?filter[id]=…</code> every
     <span id="poll">500</span> ms; switching uses <code>PATCH /wda/parameters/{id}</code>.
     If another client (for example a CODESYS application) writes the outputs, it overrides changes made here.
-    All parameters: <a href="/wda/parameters">/wda/parameters</a>.
+    All parameters: <a href="wda/parameters">/wda/parameters</a>.
   </p>
 </main>
 <script>
 "use strict";
-const P = "/wda/parameters";
+const P = "wda/parameters";       // relative: works at / and behind a prefix (/kbus/io)
 const POLL_MS = 500;
 const CLASSES = [
   { key: "di", ids: "0-0-kbus-digitalinputvalues",  name: "DI", digital: true,  write: false },
@@ -102,6 +108,7 @@ const CLASSES = [
 const $ = id => document.getElementById(id);
 let busy = false;           // the gateway serves one client at a time: never overlap requests
 let failures = 0;
+let configVersion = null;   // KBus/ConfigurationVersion the page was built for
 
 function msg(text, err) { const m = $("msg"); m.textContent = text || ""; m.className = err ? "err" : ""; }
 
@@ -124,8 +131,20 @@ async function wda(method, path, body) {
 function byId(list) { const m = {}; for (const p of list) m[p.id] = p.attributes.value; return m; }
 
 // ---------------------------------------------------------------- build the page once
+// The collection is paged (WDA: 255 per page): follow links.next.
+async function getAll(url) {
+  const list = [];
+  while (url) {
+    const doc = await wda("GET", url);
+    list.push(...doc.data);
+    const next = doc.links && doc.links.next;      // absolute (/wda/parameters?...): keep our prefix
+    url = next ? P + next.slice(next.indexOf("?")) : null;
+  }
+  return list;
+}
+
 async function init() {
-  const all = byId((await wda("GET", P)).data);
+  const all = byId(await getAll(P));
   const nmod = (all["0-0-kbus-modules"] || []).length;
   $("mods").innerHTML = "";
   for (let m = 1; m <= nmod; m++) {
@@ -167,6 +186,8 @@ async function init() {
     }
   }
   $("cycletime").textContent = all["0-0-kbus-cycletime"];
+  configVersion = all["0-0-kbus-configurationversion"];
+  $("config").textContent = configVersion;
 }
 
 // ---------------------------------------------------------------- live values
@@ -197,9 +218,16 @@ async function poll() {
   if (!busy) {
     busy = true;
     try {
-      const ids = ["0-0-kbus-healthy", "0-0-kbus-cyclecount", "0-0-kbus-errorcount"]
+      const ids = ["0-0-kbus-healthy", "0-0-kbus-cyclecount", "0-0-kbus-errorcount",
+                   "0-0-kbus-configurationversion"]
         .concat(CLASSES.filter(c => c.count).map(c => c.ids));
-      show(byId((await wda("GET", `${P}?filter[id]=${ids.join(",")}`)).data));
+      const values = byId((await wda("GET", `${P}?filter[id]=${ids.join(",")}`)).data);
+      if (values["0-0-kbus-configurationversion"] !== configVersion) {
+        await init();                      // modules added/removed: rebuild the page
+        msg(`KBUS configuration changed (configuration ${configVersion}): page updated.`);
+      } else {
+        show(values);
+      }
       failures = 0;
       $("dot").className = "dot ok"; $("conn").textContent = "online";
     } catch (e) {
@@ -237,6 +265,10 @@ function setAnalog(n, text) {
   patch(`0-0-kbus-analogoutputs-${n}-value`, v);
 }
 
+$("rescan").onclick = () => {
+  msg("Rescanning the KBUS …");
+  patch("0-0-kbus-rescan", true);
+};
 $("poll").textContent = POLL_MS;
 init().then(poll).catch(e => { msg("Cannot read /wda/parameters: " + e.message, true); setTimeout(() => location.reload(), 5000); });
 </script>

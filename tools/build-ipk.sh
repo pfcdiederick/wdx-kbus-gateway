@@ -48,6 +48,7 @@ install -m 755 "$WORK/obj/kbus-gateway"                         "$WORK/data/usr/
 mkdir -p "$WORK/data/etc/init.d"
 install -m 755 "$ROOT/packaging/ipk/etc/init.d/kbus-gateway"    "$WORK/data/etc/init.d/kbus-gateway"
 install -m 644 "$ROOT/packaging/ipk/etc/kbus-gateway.conf"      "$WORK/data/etc/kbus-gateway.conf"
+install -m 644 "$ROOT/packaging/ipk/etc/kbus-gateway-registers.conf" "$WORK/data/etc/kbus-gateway-registers.conf"
 install -m 755 "$ROOT/packaging/ipk/control/postinst"           "$WORK/control/postinst"
 install -m 755 "$ROOT/packaging/ipk/control/prerm"              "$WORK/control/prerm"
 install -m 644 "$ROOT/packaging/ipk/control/conffiles"          "$WORK/control/conffiles"
@@ -62,7 +63,7 @@ Maintainer: pfcdiederick
 Installed-Size: $SIZE
 Depends: dal, libdbuskbuscommon
 Source: https://github.com/pfcdiederick/docker-kbus-gateway
-Description: KBUS gateway: KBus DI/DO/AI/AO as wdx data layer over HTTP (/wda/parameters, JSON:API)
+Description: KBUS gateway: KBus DI/DO/AI/AO and shared registers as wdx data layer for containers (Unix socket, JSON:API)
 EOF
 
 echo ">>> 3/3 ipk"

@@ -29,8 +29,9 @@ typedef struct {
     uint64_t    cycles;
     uint64_t    errors;
     uint64_t    overruns;
-    uint32_t    last_cycle_us;
-    uint32_t    max_cycle_us;
+    uint32_t    last_cycle_us;    // duration of the last KBUS exchange
+    uint32_t    max_cycle_us;     // longest KBUS exchange
+    uint32_t    max_late_us;      // longest delay between the planned and the real start of a cycle
     int         cycle_ms;
     int         realtime;
 } gw_stats_t;
@@ -48,16 +49,29 @@ int         io_kind_writable(io_kind_t kind);
 size_t              gateway_channel_count(io_kind_t kind);
 const io_channel_t *gateway_channel(io_kind_t kind, size_t number);   // number is 1-based
 int                 gateway_read(io_kind_t kind, size_t number, int64_t *value);
-int                 gateway_write(io_kind_t kind, size_t number, int64_t value);
 
-// Bulk access (wdx array parameters, filter[id]): one lock for all channels.
+// Bulk access (wdx parameters, filter[id], batch writes): one lock for all channels.
 void gateway_snapshot(uint16_t out[IO_KIND_COUNT][GW_MAX_CHANNELS]);
-int  gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT]);
-// 1 when the last gateway_write / gateway_write_multi changed an output value.
-int  gateway_write_changed(void);
+// vals[k][i] = new value of channel i+1 of class k, or -1 = unchanged; n[k] values per class.
+// *changed (may be NULL) = 1 when an output value changed.
+int  gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT],
+                         int *changed);
+
+// Dynamic configuration: rescan the bus when the node changed.
+uint32_t gateway_config_version(void);   // +1 for every scan (startup = 1)
+void     gateway_request_rescan(void);   // manual request (wdx KBus/Rescan)
+int      gateway_rescan_due(void);       // 1 = call gateway_rescan() now
+int      gateway_rescan(void);           // server main thread only, no request running; 0 = ok
 
 const kbus_module_t *gateway_modules(size_t *count);
 void                 gateway_module_name(const kbus_module_t *m, char *buf, size_t len);
 void                 gateway_stats(gw_stats_t *out);
+void                 gateway_reset_stats(void);   // cycles, errors, maximum values and overruns back to 0
+
+#define GW_CYCLE_MS_MIN 1
+#define GW_CYCLE_MS_MAX 40
+// New cycle time, effective from the next cycle (wdx KBus/CycleTime). Returns the
+// previous value, or GW_ERANGE. A change resets the timing statistics.
+int                  gateway_set_cycle_ms(int ms);
 
 #endif

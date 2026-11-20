@@ -1,15 +1,16 @@
 // WAGO KBUS HTTP gateway
 //
-// Reads and writes the DI / DO / AI / AO channels of the I/O modules on the
-// KBUS of a WAGO PFC100/PFC200/PFC300 through the ADI/DAL interface, and
-// serves them over HTTP as a wdx data layer (/wda/parameters, JSON:API, WAGO
-// wdx/WDA conventions).
+// Owns the KBUS of a WAGO PFC100/PFC200/PFC300 (ADI/DAL interface) and serves
+// its DI / DO / AI / AO channels, plus named registers that containers share,
+// as a wdx data layer (/wda/parameters, JSON:API, WAGO wdx conventions) on a
+// Unix socket for containers and optionally on TCP.
 // Runs natively on the PTXdist firmware (opkg package, tools/build-ipk.sh).
 #include "backend.h"
 #include "config.h"
 #include "gateway.h"
 #include "http_server.h"
 #include "log.h"
+#include "registers.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -33,6 +34,7 @@ int main(void)
 
     gw_config_t cfg;
     config_load(&cfg);
+    config_load_stored(&cfg);           // cycle time written via KBus/CycleTime
     config_log(&cfg);
 
     struct sigaction sa;
@@ -56,9 +58,11 @@ int main(void)
         return 1;
     }
 
+    registers_load(&cfg);
     const int rc = http_server_run(&cfg, &g_stop);
 
     LOG_INFO("shutting down");
+    registers_save(1);
     gateway_stop();
     return rc == 0 ? 0 : 1;
 }

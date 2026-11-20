@@ -1,0 +1,4 @@
+# Ignore file of docker/example-client/Dockerfile (build context = docker/).
+*
+!lib/wdx_client.py
+!example-client/example.py

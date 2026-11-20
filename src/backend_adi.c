@@ -1,6 +1,6 @@
 // WAGO ADI/DAL backend.
 //
-// Follows the WAGO examples in Information/HowTo_ADI-MyKBusApplikation:
+// Follows the WAGO examples in docs/reference/HowTo_ADI-MyKBusApplikation:
 //   - getkbusinfo.c : module discovery through the KBUS-info D-Bus API
 //   - kbusdemo.c    : KBUS in application state "Running", every cycle is
 //                     triggered with "libpackbus_Push"

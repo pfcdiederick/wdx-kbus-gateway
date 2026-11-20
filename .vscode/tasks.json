@@ -5,8 +5,13 @@
             "label": "make (native, PC)",
             "type": "shell",
             "command": "make",
-            "problemMatcher": ["$gcc"],
-            "group": { "kind": "build", "isDefault": true }
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
         },
         {
             "label": "run simulation (http://localhost:8000)",
@@ -18,7 +23,7 @@
         {
             "label": "test: wdx data layer (simulation on port 8000)",
             "type": "shell",
-            "command": "python3 tools/test-rest.py 127.0.0.1 wda",
+            "command": "python3 tests/test-rest.py 127.0.0.1 wda",
             "problemMatcher": []
         },
         {
@@ -28,9 +33,33 @@
             "problemMatcher": []
         },
         {
-            "label": "deploy to PFC (build, opkg install, status)",
+            "label": "deploy native package to PFC (build, opkg install, status)",
             "type": "shell",
             "command": "tools/deploy.sh ${input:pfcIp}",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy containers: manager only",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --manager --no-gateway",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy containers: IEC 104 server only",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --iec104 --no-gateway",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy containers: gateway + manager + example client",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --manager --client",
+            "problemMatcher": []
+        },
+        {
+            "label": "gateway container -> native service",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --native",
             "problemMatcher": []
         }
     ],

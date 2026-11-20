@@ -1,0 +1,9 @@
+{
+    // Containers view (Docker / Container Tools extension) in this workspace: show the
+    // containers on the PFC300 (docker context "pfc300" = ssh://root@192.168.1.17).
+    // Only the extension uses this; the docker command in the terminal and
+    // tools/deploy-docker.sh keep building on this PC (context "default").
+    // Remove these lines to see the PC's own containers again.
+    "containers.environment": { "DOCKER_CONTEXT": "pfc300" },
+    "docker.environment": { "DOCKER_CONTEXT": "pfc300" }
+}

@@ -10,6 +10,9 @@
 #include <time.h>
 
 #define ERRORS_UNTIL_UNHEALTHY 10
+#define RESCAN_AFTER_MS        500     // 0.5 s of failing cycles: the node has changed
+#define RESCAN_BACKOFF_MIN_S   5       // automatic rescans: 5, 10, 20, 40, 60, 60 ... s apart
+#define RESCAN_BACKOFF_MAX_S   60
 
 static struct {
     kbus_backend_t *be;
@@ -31,6 +34,12 @@ static struct {
     int             rt_priority;
     uint32_t        consecutive_errors;
     gw_stats_t      stats;
+
+    // Dynamic configuration: a changed node is found by rescanning the bus.
+    uint32_t        config_version;     // +1 for every scan (wdx: KBus/ConfigurationVersion)
+    volatile int    rescan_requested;   // 0 no, 1 manual (now), 2 automatic (after the backoff)
+    int             rescan_backoff_s;
+    struct timespec next_auto_rescan;
 } gw;
 
 static const char *const kind_names[IO_KIND_COUNT] = { "DI", "DO", "AI", "AO" };
@@ -197,7 +206,6 @@ static void *cycle_thread(void *arg)
     (void)arg;
     static uint8_t out_snapshot[KBUS_IMAGE_BYTES];
     static uint8_t in_buffer[KBUS_IMAGE_BYTES];
-    const long period_ns = (long)gw.stats.cycle_ms * 1000000L;
     struct timespec next, t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &next);
 
@@ -212,14 +220,20 @@ static void *cycle_thread(void *arg)
         const uint32_t us = (uint32_t)timespec_diff_us(&t1, &t0);
 
         pthread_mutex_lock(&gw.lock);
+        // cycle time can be changed at run time (KBus/CycleTime): read it every cycle
+        const int cycle_ms = gw.stats.cycle_ms;
+        const long period_ns = (long)cycle_ms * 1000000L;
+        const uint32_t rescan_after = RESCAN_AFTER_MS / (uint32_t)cycle_ms;
         gw.stats.last_cycle_us = us;
         if (us > gw.stats.max_cycle_us)
             gw.stats.max_cycle_us = us;
         if (rc == 0) {
             memcpy(gw.in, in_buffer, gw.in_len);
             gw.stats.cycles++;
-            if (gw.consecutive_errors >= ERRORS_UNTIL_UNHEALTHY)
+            if (gw.consecutive_errors >= ERRORS_UNTIL_UNHEALTHY) {
                 LOG_INFO("KBUS cycle recovered");
+                gw.rescan_backoff_s = RESCAN_BACKOFF_MIN_S;
+            }
             gw.consecutive_errors = 0;
             gw.stats.healthy = 1;
         } else {
@@ -228,6 +242,10 @@ static void *cycle_thread(void *arg)
                 gw.stats.healthy = 0;
                 LOG_ERROR("KBUS cycle failing (%u errors in a row)", gw.consecutive_errors);
             }
+            // Persistent errors usually mean the node was changed (modules added or
+            // removed): ask the HTTP thread to rescan. No slow work in this thread.
+            if (gw.consecutive_errors == rescan_after && !gw.rescan_requested)
+                gw.rescan_requested = 2;
         }
         pthread_mutex_unlock(&gw.lock);
 
@@ -240,6 +258,11 @@ static void *cycle_thread(void *arg)
         }
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR && gw.running)
             ;
+        // scheduling jitter: how late did this thread wake up?
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const int64_t late = timespec_diff_us(&now, &next);
+        if (late > (int64_t)gw.stats.max_late_us)
+            gw.stats.max_late_us = (uint32_t)late;
     }
 
     // Safe state: switch all outputs off with one last cycle.
@@ -251,6 +274,7 @@ static void *cycle_thread(void *arg)
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+static int scan_bus(void);
 int gateway_init(const gw_config_t *cfg, kbus_backend_t *backend)
 {
     memset(&gw, 0, sizeof(gw));
@@ -262,20 +286,35 @@ int gateway_init(const gw_config_t *cfg, kbus_backend_t *backend)
     gw.stats.cycle_ms = cfg->cycle_ms;
     gw.stats.healthy = 1;
 
+    gw.rescan_backoff_s = RESCAN_BACKOFF_MIN_S;
+
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);  // avoid priority inversion
     pthread_mutex_init(&gw.lock, &attr);
     pthread_mutexattr_destroy(&attr);
 
+    return scan_bus();
+}
+
+// Open the bus, read the modules and build the channel map. Used at startup
+// and for every rescan. The cycle thread must not run.
+static int scan_bus(void)
+{
+    kbus_backend_t *backend = gw.be;
+    gw.config_version++;                 // the tree changes, also when the scan fails
     if (backend->open(backend, gw.modules, KBUS_MAX_MODULES, &gw.module_count,
                       &gw.in_len, &gw.out_len) != 0) {
         backend->close(backend);
+        gw.module_count = 0;
+        gw.in_len = gw.out_len = 0;
         return -1;
     }
     if (gw.in_len > KBUS_IMAGE_BYTES || gw.out_len > KBUS_IMAGE_BYTES) {
         LOG_ERROR("process image larger than %d bytes", KBUS_IMAGE_BYTES);
         backend->close(backend);
+        gw.module_count = 0;
+        gw.in_len = gw.out_len = 0;
         return -1;
     }
     build_channel_map();
@@ -288,10 +327,70 @@ int gateway_init(const gw_config_t *cfg, kbus_backend_t *backend)
                  gw.modules[mi].in_size_bits, gw.modules[mi].in_offset_bits,
                  gw.modules[mi].out_size_bits, gw.modules[mi].out_offset_bits);
     }
-    LOG_INFO("channels: %zu DI, %zu DO, %zu AI, %zu AO; %zu x 750-495",
+    LOG_INFO("channels: %zu DI, %zu DO, %zu AI, %zu AO; %zu x 750-495 (configuration %u)",
              gw.ch_count[IO_DI], gw.ch_count[IO_DO], gw.ch_count[IO_AI], gw.ch_count[IO_AO],
-             gw.count_495);
+             gw.count_495, gw.config_version);
     return 0;
+}
+
+uint32_t gateway_config_version(void) { return gw.config_version; }
+
+void gateway_request_rescan(void) { gw.rescan_requested = 1; }
+
+int gateway_rescan_due(void)
+{
+    if (!gw.rescan_requested)
+        return 0;
+    if (gw.rescan_requested == 1)
+        return 1;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return timespec_diff_us(&now, &gw.next_auto_rescan) >= 0;
+}
+
+// Rescan the bus (called by the HTTP thread, never by the cycle thread):
+// stop the cycle (outputs to 0), close, open + scan again, rebuild the channel
+// map, start the cycle. Outputs stay 0 until clients write them again.
+int gateway_rescan(void)
+{
+    const int automatic = gw.rescan_requested == 2;
+    gw.rescan_requested = 0;
+    LOG_INFO("KBUS rescan (%s)", automatic ? "after persistent cycle errors" : "requested");
+
+    if (gw.thread_started) {
+        gw.running = 0;
+        pthread_join(gw.thread, NULL);
+        gw.thread_started = 0;
+    }
+    gw.be->close(gw.be);
+
+    pthread_mutex_lock(&gw.lock);
+    gw.module_count = 0;
+    gw.count_495 = 0;
+    memset(gw.ch_count, 0, sizeof(gw.ch_count));
+    memset(gw.in, 0, sizeof(gw.in));
+    memset(gw.out, 0, sizeof(gw.out));
+    gw.consecutive_errors = 0;
+    pthread_mutex_unlock(&gw.lock);
+
+    const int rc = scan_bus();
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (automatic || rc != 0) {
+        // the next automatic rescan only after the backoff time
+        gw.next_auto_rescan = now;
+        gw.next_auto_rescan.tv_sec += gw.rescan_backoff_s;
+        gw.rescan_backoff_s = gw.rescan_backoff_s * 2 > RESCAN_BACKOFF_MAX_S ? RESCAN_BACKOFF_MAX_S
+                                                                              : gw.rescan_backoff_s * 2;
+    }
+    if (rc != 0) {
+        gw.stats.healthy = 0;
+        gw.rescan_requested = 2;                       // try again after the backoff
+        LOG_ERROR("KBUS rescan failed; next attempt in %d s", (int)(gw.next_auto_rescan.tv_sec - now.tv_sec));
+        return -1;
+    }
+    gw.stats.healthy = 1;
+    return gateway_start();
 }
 
 int gateway_start(void)
@@ -368,32 +467,6 @@ int gateway_read(io_kind_t kind, size_t number, int64_t *value)
     return GW_OK;
 }
 
-// Did the last gateway_write / gateway_write_multi change any output value?
-// (Only used by the single-threaded HTTP server, to log real changes only.)
-static int last_write_changed;
-int gateway_write_changed(void) { return last_write_changed; }
-
-int gateway_write(io_kind_t kind, size_t number, int64_t value)
-{
-    last_write_changed = 0;
-    if (!io_kind_writable(kind))
-        return GW_EREADONLY;
-    if (number == 0 || number > gw.ch_count[kind])
-        return GW_ENOENT;
-    io_channel_t *ch = &gw.ch[kind][number - 1];
-    const int64_t max = ch->bit_width == 1 ? 1 : 65535;
-    if (value < 0 || value > max)
-        return GW_ERANGE;
-
-    pthread_mutex_lock(&gw.lock);
-    last_write_changed = (ch->value != (uint16_t)value);
-    ch->value = (uint16_t)value;
-    if (ch->mapped)
-        bits_set(gw.out, ch->bit_offset, ch->bit_width, (uint32_t)value);
-    pthread_mutex_unlock(&gw.lock);
-    return GW_OK;
-}
-
 // Bulk read: every channel of every class under ONE lock, so the values come
 // from the same KBUS cycle. Outputs give the value last written.
 void gateway_snapshot(uint16_t out[IO_KIND_COUNT][GW_MAX_CHANNELS])
@@ -415,9 +488,11 @@ void gateway_snapshot(uint16_t out[IO_KIND_COUNT][GW_MAX_CHANNELS])
 // leave it unchanged; n[k] values per class (0 = class not written). Every
 // value is checked first; then all are applied under ONE lock, so the KBUS
 // cycle sends them together. Nothing is written when one value is invalid.
-int gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT])
+// *changed (may be NULL) = 1 when an output value changed.
+int gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n[IO_KIND_COUNT],
+                        int *changed)
 {
-    last_write_changed = 0;
+    int ch_any = 0;
     for (int k = 0; k < IO_KIND_COUNT; ++k) {
         if (n[k] == 0)
             continue;
@@ -438,13 +513,15 @@ int gateway_write_multi(const int32_t *const vals[IO_KIND_COUNT], const size_t n
                 continue;
             io_channel_t *ch = &gw.ch[k][i];
             if (ch->value != (uint16_t)vals[k][i])
-                last_write_changed = 1;
+                ch_any = 1;
             ch->value = (uint16_t)vals[k][i];
             if (ch->mapped)
                 bits_set(gw.out, ch->bit_offset, ch->bit_width, (uint32_t)vals[k][i]);
         }
     }
     pthread_mutex_unlock(&gw.lock);
+    if (changed)
+        *changed = ch_any;
     return GW_OK;
 }
 
@@ -458,5 +535,32 @@ void gateway_stats(gw_stats_t *out)
 {
     pthread_mutex_lock(&gw.lock);
     *out = gw.stats;
+    pthread_mutex_unlock(&gw.lock);
+}
+
+int gateway_set_cycle_ms(int ms)
+{
+    if (ms < GW_CYCLE_MS_MIN || ms > GW_CYCLE_MS_MAX)
+        return GW_ERANGE;
+    pthread_mutex_lock(&gw.lock);
+    const int old = gw.stats.cycle_ms;
+    if (ms != old) {
+        gw.stats.cycle_ms = ms;
+        gw.stats.max_cycle_us = 0;                        // the statistics belong to one cycle time
+        gw.stats.max_late_us = 0;
+        gw.stats.overruns = 0;
+    }
+    pthread_mutex_unlock(&gw.lock);
+    return old;
+}
+
+void gateway_reset_stats(void)
+{
+    pthread_mutex_lock(&gw.lock);
+    gw.stats.cycles = 0;                                  // KBus/ResetStatistics: all statistics
+    gw.stats.errors = 0;
+    gw.stats.max_cycle_us = 0;
+    gw.stats.max_late_us = 0;
+    gw.stats.overruns = 0;
     pthread_mutex_unlock(&gw.lock);
 }
