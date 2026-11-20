@@ -11,6 +11,7 @@
 #include "http_server.h"
 #include "log.h"
 #include "registers.h"
+#include "serial.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -59,9 +60,11 @@ int main(void)
     }
 
     registers_load(&cfg);
+    serial_start(&cfg);                 // COM1 (SERIAL_DEVICE), transparent forwarding
     const int rc = http_server_run(&cfg, &g_stop);
 
     LOG_INFO("shutting down");
+    serial_stop();
     registers_save(1);
     gateway_stop();
     return rc == 0 ? 0 : 1;

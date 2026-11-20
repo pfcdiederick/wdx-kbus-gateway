@@ -127,7 +127,12 @@ table.grid tr:last-child td { border-bottom: none; }
 .io-item { width: 64px; text-align: center; font-size: 11px; text-transform: uppercase; }
 .io-item .lamp { width: 26px; height: 26px; margin: 4px auto; border-radius: 50%; border: 1px solid rgb(120, 120, 120); background: rgb(230, 230, 230); }
 .io-item .lamp.on { background: rgb(185, 214, 129); border-color: var(--green-dark); }
-.io-item button { min-width: 0; width: 64px; height: 30px; padding: 0; font-size: 11px; }
+/* digital outputs: the ON/OFF button shows the state and switches (no lamp) */
+.io-item button { display: block; min-width: 0; width: 64px; height: 30px; margin: 4px auto 0; padding: 0; font-size: 11px; }
+/* digital inputs: the same box as the output buttons, but only a display */
+.io-item .io-state { box-sizing: border-box; width: 64px; height: 30px; margin: 4px auto 0; line-height: 28px;
+  border: 1px solid var(--green-dark); border-radius: 2px; background: #fff; color: var(--green-dark); cursor: default; }
+.io-item .io-state.on { background: var(--green); color: #fff; }
 .io-item .sub { color: rgb(120, 120, 120); text-transform: none; }
 .analog { display: grid; grid-template-columns: 60px 1fr 70px; gap: 6px 12px; align-items: center; padding: 9px; }
 .analog .bar { height: 10px; border: 1px solid var(--line); border-radius: 2px; background: #fff; overflow: hidden; }
@@ -256,14 +261,41 @@ body.logged-in .anon-only { display: none !important; }
         </div></div>
       </div>
 
-      <!-- Settings / KBUS Cycle -->
+      <!-- Settings / KBUS -->
       <div class="wbm-page" id="page-settings-cycle">
-        <h2 class="page">KBUS Cycle</h2>
+        <h2 class="page">KBUS</h2>
         <p class="note">Changes take effect at the next cycle and are kept after a restart. A change resets the timing statistics.</p>
         <div class="form collapsible"><span class="title">Cycle Time</span><div class="body">
           <div class="field"><label>Current Cycle Time</label><div class="control value" id="cyc-now">–</div></div>
           <div class="field"><label>New Cycle Time (ms)</label><div class="control"><input type="number" id="cyc" min="1" max="40" step="1"></div></div>
           <div class="buttons"><button class="w action" id="cycset">Submit</button></div>
+        </div></div>
+      </div>
+
+      <!-- Settings / COM1 -->
+      <div class="wbm-page" id="page-settings-serial">
+        <h2 class="page">COM1</h2>
+        <p class="note">The gateway forwards COM1 transparently over WDX (<code>Serial/Com1/...</code>). The settings are made
+          on the client side: CODESYS sets them with <code>FB_WdaSerial</code> (inputs <code>udiSetBaudrate</code>,
+          <code>sSetFormat</code>, <code>uiSetFrameGap</code>); this page shows them. RS-232 / RS-485 is set in the WBM
+          (Interfaces &gt; Serial Interface, owner "None").</p>
+        <p class="note" id="ser-off" style="display:none">COM1 is off in the gateway (SERIAL_DEVICE empty).</p>
+        <div class="form collapsible" id="ser-form"><span class="title">Settings (set by CODESYS)</span><div class="body">
+          <div class="field"><label>Device</label><div class="control" id="ser-device">–</div></div>
+          <div class="field"><label>State</label><div class="control" id="ser-open">–</div></div>
+          <div class="field"><label>Baud Rate</label><div class="control value" id="ser-baud">–</div></div>
+          <div class="field"><label>Format</label><div class="control value" id="ser-format">–</div></div>
+          <div class="field"><label>Frame Gap</label><div class="control value" id="ser-gap"
+            title="A pause of this length ends a received frame">–</div></div>
+        </div></div>
+        <div class="form collapsible" id="ser-mon"><span class="title">Monitor</span><div class="body">
+          <div class="field"><label>Sent / Received</label><div class="control value" id="ser-counts">–</div></div>
+          <div class="field"><label>Frames / Errors</label><div class="control value" id="ser-frames">–</div></div>
+          <div class="field"><label>Last Frame</label><div class="control value mono" id="ser-frame">–</div></div>
+          <div class="field"><label>Received (last 512 bytes)</label><div class="control value mono" id="ser-rx" style="word-break:break-all">–</div></div>
+          <div class="field"><label for="ser-tx">Send (test)</label><div class="control"><input type="text" id="ser-tx" maxlength="200"
+            placeholder="text; \r \n \xNN for bytes"></div></div>
+          <div class="buttons"><button class="w" id="ser-send">Send</button></div>
         </div></div>
       </div>
 
@@ -318,7 +350,7 @@ const MENU = [
   { id: "io", title: "I/O", pages: [["process", "Process Image"]] },
   { id: "params", title: "Parameters", pages: [["all", "All Parameters"]] },
   { id: "regs", title: "Registers", pages: [["registers", "Registers"]] },
-  { id: "settings", title: "Settings", pages: [["cycle", "KBUS Cycle"], ["login", "Login"]] },
+  { id: "settings", title: "Settings", pages: [["cycle", "KBUS"], ["serial", "COM1"], ["login", "Login"]] },
 ];
 let tab = "status", page = "kbus";
 $("main-menu").innerHTML = MENU.map(m =>
@@ -334,6 +366,7 @@ function route() {
   document.querySelectorAll(".sub-content .wbm-page").forEach(d => d.classList.toggle("active", d.id === `page-${tab}-${page}`));
   msg("");
   refresh();
+  if (typeof startEvents === "function" && defs.length) startEvents();
 }
 window.addEventListener("hashchange", route);
 document.addEventListener("click", e => {             // collapsible panels
@@ -469,10 +502,10 @@ function where(c, n) {
 function buildIO() {
   const count = c => ((byId["0-0-kbus-" + CLS[c][1]] || {}).value || []).length;
   $("io-di").innerHTML = [...Array(count("di"))].map((_, i) =>
-    `<div class="io-item" title="${where("di", i + 1)}">DI${i + 1}<div class="lamp" id="di-${i}"></div></div>`).join("") || "<span>none</span>";
+    `<div class="io-item" title="${where("di", i + 1)}">DI${i + 1}<div class="io-state" id="di-${i}" role="status" aria-label="DI${i + 1}">OFF</div></div>`).join("") || "<span>none</span>";
   $("io-do").innerHTML = [...Array(count("do"))].map((_, i) =>
-    `<div class="io-item" title="${where("do", i + 1)}">DO${i + 1}<div class="lamp" id="do-${i}"></div>`
-    + `<button class="w" data-do="${i + 1}" id="dob-${i}">OFF</button></div>`).join("") || "<span>none</span>";
+    `<div class="io-item" title="${where("do", i + 1)}">DO${i + 1}`
+    + `<button class="w" data-do="${i + 1}" id="dob-${i}" aria-label="DO${i + 1}">OFF</button></div>`).join("") || "<span>none</span>";
   $("io-ai").innerHTML = [...Array(count("ai"))].map((_, i) =>
     `<span title="${where("ai", i + 1)}">AI${i + 1}</span><div class="bar"><div id="aib-${i}"></div></div><span class="num" id="ai-${i}">–</span>`).join("") || "<span>none</span>";
   $("io-ao").innerHTML = [...Array(count("ao"))].map((_, i) =>
@@ -482,11 +515,14 @@ function buildIO() {
   applyReadonly();
 }
 function renderIO(v) {
-  (v["0-0-kbus-digitalinputvalues"] || []).forEach((x, i) => { const l = $("di-" + i); if (l) l.classList.toggle("on", x); });
+  (v["0-0-kbus-digitalinputvalues"] || []).forEach((x, i) => {
+    const d = $("di-" + i);
+    if (d) { d.classList.toggle("on", x); d.textContent = x ? "ON" : "OFF"; }
+  });
   (v["0-0-kbus-digitaloutputvalues"] || []).forEach((x, i) => {
-    const l = $("do-" + i), b = $("dob-" + i);
-    if (l) l.classList.toggle("on", x);
-    if (b) { b.textContent = x ? "ON" : "OFF"; b.classList.toggle("action", x); b.dataset.state = x ? "1" : "0"; }
+    const b = $("dob-" + i);
+    if (b) { b.textContent = x ? "ON" : "OFF"; b.classList.toggle("action", x); b.dataset.state = x ? "1" : "0";
+             b.setAttribute("aria-pressed", x ? "true" : "false"); }
   });
   for (const c of ["ai", "ao"]) (v[`0-0-kbus-${CLS[c][1]}`] || []).forEach((x, i) => {
     const n = $(`${c}-${i}`), b = $(`${c}b-${i}`);
@@ -611,6 +647,37 @@ $("sform").addEventListener("submit", async e => {
     await loadSettings();
   } catch (err) { msg(err.message); }
 });
+// ---- serial COM1 ---------------------------------------------------------------
+const SER = "0-0-serial-com1-";
+const SER_IDS = ["device", "open", "baudrate", "format", "framegap", "txcount", "rxcount", "rxdata", "rxframe",
+                 "rxframecount", "errors"].map(x => SER + x);
+// bytes (one character per byte) -> readable: printable ASCII as is, the rest as <XX>
+const showBytes = s => s.replace(/[^\x20-\x7e]/g, c => "<" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0") + ">");
+function renderSerial(v) {
+  const on = (SER + "open") in v;
+  $("ser-off").style.display = on ? "none" : "";
+  $("ser-form").style.display = $("ser-mon").style.display = on ? "" : "none";
+  if (!on) return;
+  $("ser-device").textContent = v[SER + "device"];
+  $("ser-open").className = "control " + (v[SER + "open"] ? "ok-text" : "bad-text");
+  $("ser-open").textContent = v[SER + "open"] ? "open" : "not open (device missing, or used by another program)";
+  const f = v[SER + "format"] || "";
+  const parity = { N: "none", E: "even", O: "odd" }[f[1]] || "?";
+  $("ser-baud").textContent = `${v[SER + "baudrate"]} baud`;
+  $("ser-format").textContent = f ? `${f}  (${f[0]} data bits, parity ${parity}, ${f[2]} stop bit${f[2] === "2" ? "s" : ""})` : "–";
+  $("ser-gap").textContent = `${v[SER + "framegap"]} ms`;
+  $("ser-counts").textContent = `${v[SER + "txcount"]} / ${v[SER + "rxcount"]} bytes`;
+  $("ser-frames").textContent = `${v[SER + "rxframecount"]} / ${v[SER + "errors"]}`;
+  $("ser-frame").textContent = showBytes(v[SER + "rxframe"] || "") || "–";
+  $("ser-rx").textContent = showBytes(v[SER + "rxdata"] || "") || "–";
+}
+$("ser-send").addEventListener("click", () => {
+  const t = $("ser-tx").value.replace(/\\r/g, "\r").replace(/\\n/g, "\n")
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  if (!t) return msg("Enter something to send.");
+  patch(SER + "transmit", t).then(refresh);
+});
+
 $("cycset").addEventListener("click", () => {
   const v = Number($("cyc").value);
   if (!Number.isInteger(v) || v < 1 || v > 40) return msg("Cycle time: whole number 1..40 ms.");
@@ -638,30 +705,67 @@ async function clock() {
   } catch (e) { /* keep the last time */ }
 }
 const IO_IDS = Object.values(CLS).map(c => "0-0-kbus-" + c[1]);
+// ids the current page shows; null = Parameters tab (all parameters, polled)
+function pageIds() {
+  if (tab === "params") return null;
+  let ids = STATUS_IDS;
+  if (tab === "io") ids = ids.concat(IO_IDS);
+  if (tab === "regs") ids = ids.concat(regs().map(x => x.id));
+  if (tab === "settings" && page === "serial") ids = ids.concat(SER_IDS);
+  return ids;
+}
+
+// Values: a full set (refresh) or only the changes (live events), merged into `live`
+let live = {};
+let loadingDefs = false;
+function render(v) {
+  Object.assign(live, v);
+  renderStatus(live);
+  if (tab === "io") renderIO(live);
+  if (tab === "settings" && page === "serial") renderSerial(live);
+  for (const id in v) {
+    const def = byId[id];
+    if (def) def.value = v[id];
+    if (tab === "params" || tab === "regs")
+      document.querySelectorAll(`td[data-id="${CSS.escape(id)}"]`).forEach(td => td.textContent = show(v[id]));
+  }
+  led("led-gw", "green", "kbus-gateway reachable");
+  const cv = v["0-0-kbus-configurationversion"];
+  if (configVersion !== null && cv !== undefined && cv !== configVersion && !loadingDefs) {
+    loadingDefs = true;
+    loadDefs().then(startEvents).finally(() => { loadingDefs = false; });
+  }
+}
+function gwDown() { led("led-gw", "red", "kbus-gateway not reachable"); led("led-kbus", "", "unknown"); }
+
 let busy = false;
 async function refresh() {
   if (busy) return;
   busy = true;
   try {
-    let ids = STATUS_IDS;
-    if (tab === "io") ids = ids.concat(IO_IDS);
-    if (tab === "regs") ids = ids.concat(regs().map(x => x.id));
-    const d = await api("GET", tab === "params" ? P : `${P}?filter[id]=${ids.join(",")}`);
-    const v = Object.fromEntries(d.data.map(x => [x.id, x.attributes.value]));
-    renderStatus(v);
-    if (tab === "io") renderIO(v);
-    for (const x of d.data) {
-      const def = byId[x.id];
-      if (def) def.value = x.attributes.value;
-      if (tab === "params" || tab === "regs")
-        document.querySelectorAll(`td[data-id="${CSS.escape(x.id)}"]`).forEach(td => td.textContent = show(x.attributes.value));
-    }
-    led("led-gw", "green", "kbus-gateway reachable");
-    if (configVersion !== null && v["0-0-kbus-configurationversion"] !== undefined && v["0-0-kbus-configurationversion"] !== configVersion)
-      await loadDefs();
-  } catch (e) {
-    led("led-gw", "red", "kbus-gateway not reachable"); led("led-kbus", "", "unknown");
-  } finally { busy = false; }
+    const ids = pageIds();
+    const d = await api("GET", ids ? `${P}?filter[id]=${ids.join(",")}&page[limit]=1000` : P + "?page[limit]=1000");
+    render(Object.fromEntries(d.data.map(x => [x.id, x.attributes.value])));
+  } catch (e) { gwDown(); } finally { busy = false; }
+}
+
+// Live values: one open connection (Server-Sent Events), only changes, every ~50 ms.
+// While it delivers (esLast younger than 3 s) the polling below pauses.
+let es = null, esIds = "", esLast = 0;
+function startEvents() {
+  const ids = pageIds();
+  if (!window.EventSource || !ids) {
+    if (es) { es.close(); es = null; esIds = ""; }
+    return;
+  }
+  const key = ids.join(",");
+  if (es && esIds === key && es.readyState !== 2) return;
+  if (es) es.close();
+  esIds = key;
+  es = new EventSource("api/events?ids=" + encodeURIComponent(key));
+  es.onmessage = e => { esLast = Date.now(); render(JSON.parse(e.data)); };
+  es.addEventListener("ping", () => { esLast = Date.now(); });
+  es.addEventListener("gwerror", () => { esLast = Date.now(); gwDown(); });
 }
 function applyReadonly() {
   document.querySelectorAll("button.w").forEach(b => b.disabled = READONLY);
@@ -673,9 +777,13 @@ showLogin();
 loadSettings();
 clock(); setInterval(clock, 1000);
 route();
-loadDefs().then(refresh).catch(e => msg(e.message));
-let tick = 0;                                         // I/O every 300 ms, other pages every 900 ms
-setInterval(() => { tick++; if (tab === "io" || tick % 3 === 0) refresh(); }, 300);
+loadDefs().then(() => { refresh(); startEvents(); }).catch(e => msg(e.message));
+let tick = 0;            // fallback without live values: I/O every 300 ms, other pages every 900 ms
+setInterval(() => {
+  tick++;
+  if (es && Date.now() - esLast < 3000) return;       // live values arrive: no polling
+  if (tab === "io" || tick % 3 === 0) refresh();
+}, 300);
 </script>
 </body>
 </html>

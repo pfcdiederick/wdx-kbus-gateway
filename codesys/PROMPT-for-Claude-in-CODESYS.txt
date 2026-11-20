@@ -1,0 +1,1406 @@
+BRIEF FOR CLAUDE IN CODESYS (MCP): add FB_WdaKbusIo and FB_WdaSerial to this project
+===================================================================================
+
+You work in the open CODESYS project through MCP. Add the objects at the end of
+this text. Follow the rules exactly. Report at the end.
+
+CONTEXT
+-------
+- Controller: WAGO PFC300 750-8302. The KBUS is NOT in the device tree. A program
+  named kbus-gateway owns the KBUS (8 DI + 8 DO) and the serial port COM1, and
+  publishes them as a WAGO Device Access (WDA) REST-API on
+  http://127.0.0.1:8000/wda/parameters (JSON:API, HTTP/1.0, one request per connection).
+- The project already talks to it: PLC_PRG calls FB_WdxKbusIo (the older function
+  block) and drives a running light on DO1..DO8. That stays as it is.
+- New, to add:
+  * FB_WdaKbusIo - cyclic KBUS I/O every 5 ms using only standard WDA requests;
+    reads the channel counts from the gateway; output xLocalControl when the
+    dashboard has taken local control.
+  * FB_WdaSerial - COM1 through the gateway: send with a rising edge on xSend,
+    receive frames (xNewFrame, sFrame / abFrame); the COM1 settings (baud rate,
+    format, frame gap) can be set with udiSetBaudrate / sSetFormat / uiSetFrameGap
+    (0 / '' = keep) and are read in udiBaudrate / sFormat / uiFrameGap.
+  * helper functions F_Wda*, and two example programs.
+
+RULES
+-----
+1. Strictly additive. Do not change PLC_PRG, other existing POUs, the task
+   configuration, the device tree or the library manager, except for the
+   single exception in rule 3.
+2. Create every object of the list below that does not exist yet, with exactly
+   the object type, name, declaration and implementation given. In each object,
+   the part under "DECLARATION" goes into the declaration editor and the part
+   under "IMPLEMENTATION" into the implementation editor (language ST).
+3. Objects that already exist (normally GVL_KbusRest, F_AppendStr, F_FindBytes,
+   FB_HttpTransaction):
+   - If the existing object is functionally the same as the text below: leave it.
+   - FB_HttpTransaction: the existing version has a 4 KB receive buffer
+     (abRx : ARRAY[0..4095] OF BYTE). Change ONLY that declaration line to
+     abRx : ARRAY[0..8191] OF BYTE;  (the new WDA answers can exceed 4 KB).
+     Nothing else in it. FB_WdxKbusIo keeps working with it.
+   - Any other difference: STOP and ask the user before changing anything.
+4. Library: the code uses "CAA Net Base Services" (namespace NBS) and Standard.
+   They should already be referenced (FB_HttpTransaction uses NBS). If NBS is
+   missing, STOP and ask. If a pin name of NBS.TCP_Connection / TCP_Write /
+   TCP_Read / IP_ADDR differs in the library version of this project, adapt
+   FB_HttpTransaction minimally and list every change.
+5. Do NOT add PRG_WdaKbusIo_Example or PRG_WdaSerial_Example to a task, and do
+   not call FB_WdaKbusIo from PLC_PRG: FB_WdxKbusIo in PLC_PRG already writes the
+   outputs, and two writers would overwrite each other. The user decides when
+   to switch (see NEXT STEPS).
+6. Build (Build / Generate code). Fix compile errors only in the NEW objects, with
+   the smallest possible change, and list each change with the reason. If an
+   error needs a change in an existing object, STOP and ask.
+7. Do not log in, download, do an online change or start/stop the application.
+8. Report at the end: objects created / left / changed, every code change,
+   the build result (errors, warnings), and open questions.
+
+NEXT STEPS (only when the user asks for them later)
+---------------------------------------------------
+- Switch the KBUS I/O to FB_WdaKbusIo: remove the FB_WdxKbusIo call from PLC_PRG
+  (or set its xEnable FALSE), add a cyclic task "KbusIoTask", 1 ms, priority
+  higher than the main task, running PRG_WdaKbusIo_Example (or a program with
+  fbIo(xEnable := TRUE, tInterval := T#5MS)). Channel counts come from the gateway.
+- COM1: add PRG_WdaSerial_Example to a cyclic task (e.g. 10 ms) when a device is
+  connected. Needs kbus-gateway 2.5.0 (installed on the test controller).
+
+INTERFACE SUMMARY (for checking the code, nothing to create)
+-------------------------------------------------------------
+- Read I/O:   GET /wda/parameters?filter[path]=KBus/Healthy,KBus/ConfigurationVersion,
+              KBus/LocalControl,KBus/DigitalInputValues,KBus/DigitalOutputValues,
+              KBus/AnalogInputValues,KBus/AnalogOutputValues          -> 200
+- Write I/O:  PATCH /wda/parameters  {"data":[{"type":"parameters","id":"0-0-kbus-digitaloutputvalues",
+              "attributes":{"value":[true,false,...]}}, {...analogoutputvalues...}]}  -> 204
+- Discovery:  GET /wda/parameters?filter[path]=KBus/ConfigurationVersion,KBus/DigitalInputs,
+              KBus/DigitalOutputs,KBus/AnalogInputs,KBus/AnalogOutputs (count the array items)
+- COM1 send:  PATCH /wda/parameters/0-0-serial-com1-transmit  value = string, one
+              character per byte, bytes outside printable ASCII as \u00XX  -> 204
+- COM1 read:  GET /wda/parameters?filter[path]=Serial/Com1/Open,...,Serial/Com1/RxFrame,
+              Serial/Com1/RxFrameCount,...                              -> 200
+- Errors:     {"errors":[{"status":"400","title":...,"detail":...,"code":"39",...}]}
+              (code = WDA status code; 403/57 = local control or setting only in the dashboard)
+
+OBJECTS (14)
+-----------
+
+=== OBJECT 1/14: GVL_KbusRest  (Global Variable List  (attribute qualified_only)) ===
+--- DECLARATION ---
+// ===========================================================================
+// GVL_KbusRest  -  constants for the kbus-gateway REST client
+// Object type in CODESYS: Global Variable List  (attribute qualified_only)
+// ===========================================================================
+{attribute 'qualified_only'}
+VAR_GLOBAL CONSTANT
+    gc_sGatewayHost   : STRING(15) := '127.0.0.1';   // both containers use the host network
+    gc_uiGatewayPort  : UINT       := 8000;          // HTTP_PORT of the kbus-gateway
+    gc_uiMaxDigital   : UINT       := 64;            // array size for DI / DO
+    gc_uiMaxAnalog    : UINT       := 32;            // array size for AI / AO
+END_VAR
+--- IMPLEMENTATION ---
+(none: global variable list)
+=== END OF GVL_KbusRest ===
+
+=== OBJECT 2/14: F_AppendStr  (POU, Function, return type BOOL, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_AppendStr  -  append the bytes of a STRING to a byte buffer
+// Object type in CODESYS: POU, Function, return type BOOL, language ST
+//
+// Used to build HTTP requests longer than 255 characters (the Standard
+// library string functions CONCAT/MID/FIND are limited to 255 characters).
+// Returns FALSE when the buffer was full and the text was cut off.
+// ===========================================================================
+FUNCTION F_AppendStr : BOOL
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;      // start of the buffer
+    udiCap  : UDINT;                // size of the buffer in bytes
+    sText   : STRING(80);           // text to append
+END_VAR
+VAR_IN_OUT
+    udiLen  : UDINT;                // bytes used in the buffer (updated)
+END_VAR
+VAR
+    pS      : POINTER TO BYTE;
+    i       : UDINT;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+pS := ADR(sText);
+i := 0;
+WHILE (pS[i] <> 0) AND (udiLen < udiCap) DO
+    pBuf[udiLen] := pS[i];
+    udiLen := udiLen + 1;
+    i := i + 1;
+END_WHILE
+F_AppendStr := (pS[i] = 0);
+=== END OF F_AppendStr ===
+
+=== OBJECT 3/14: F_FindBytes  (POU, Function, return type DINT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_FindBytes  -  find a text in a byte buffer
+// Object type in CODESYS: POU, Function, return type DINT, language ST
+//
+// Returns the 0-based position of sPattern in pBuf[udiFrom..udiLen-1], or -1.
+// Works on buffers longer than 255 characters (Standard FIND does not).
+// ===========================================================================
+FUNCTION F_FindBytes : DINT
+VAR_INPUT
+    pBuf     : POINTER TO BYTE;
+    udiLen   : UDINT;               // bytes in the buffer
+    udiFrom  : UDINT;               // start position (0-based)
+    sPattern : STRING(80);
+END_VAR
+VAR
+    pP       : POINTER TO BYTE;
+    udiPLen  : UDINT;
+    i        : UDINT;
+    j        : UDINT;
+    xMatch   : BOOL;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_FindBytes := -1;
+udiPLen := TO_UDINT(LEN(sPattern));
+pP := ADR(sPattern);
+IF (udiPLen = 0) OR (udiLen < udiPLen) THEN
+    RETURN;
+END_IF
+i := udiFrom;
+WHILE i + udiPLen <= udiLen DO
+    xMatch := TRUE;
+    j := 0;
+    WHILE xMatch AND (j < udiPLen) DO
+        IF pBuf[i + j] <> pP[j] THEN
+            xMatch := FALSE;
+        END_IF
+        j := j + 1;
+    END_WHILE
+    IF xMatch THEN
+        F_FindBytes := TO_DINT(i);
+        RETURN;
+    END_IF
+    i := i + 1;
+END_WHILE
+=== END OF F_FindBytes ===
+
+=== OBJECT 4/14: F_WdaValuePos  (POU, Function, return type DINT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_WdaValuePos  -  position of the value of one parameter in a WDA answer
+// Object type in CODESYS: POU, Function, return type DINT, language ST
+// Uses: F_FindBytes
+//
+// A WDA parameter resource looks like
+//   {"type":"parameters","id":"...","attributes":{"path":"KBus/AnalogInputValues",
+//    "dataType":"uint16","dataRank":"array","value":[0,16384],"stringValue":[...]}}
+// Returns the 0-based position of the first character after "value": of the
+// resource with this path, or -1 when the path is not in the answer.
+// The closing quote is part of the search, so "KBus/DigitalInputs" does not
+// match "KBus/DigitalInputs/1/Value".
+// ===========================================================================
+FUNCTION F_WdaValuePos : DINT
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;
+    udiLen  : UDINT;
+    sPath   : STRING(60);           // e.g. 'KBus/DigitalInputValues'
+END_VAR
+VAR
+    diPos   : DINT;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_WdaValuePos := -1;
+diPos := F_FindBytes(pBuf, udiLen, 0, CONCAT(CONCAT('"path":"', sPath), '"'));
+IF diPos >= 0 THEN
+    diPos := F_FindBytes(pBuf, udiLen, TO_UDINT(diPos), '"value":');
+    IF diPos >= 0 THEN
+        F_WdaValuePos := diPos + 8;
+    END_IF
+END_IF
+=== END OF F_WdaValuePos ===
+
+=== OBJECT 5/14: F_WdaCountItems  (POU, Function, return type INT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_WdaCountItems  -  number of items in the array value of one parameter
+// Object type in CODESYS: POU, Function, return type INT, language ST
+// Uses: F_WdaValuePos, F_FindBytes
+//
+// For parameters of data type instantiations (KBus/DigitalInputs, ...): the
+// WDA manual says only the NUMBER of items counts, their content is internal.
+// Items are counted at the top level, so nested objects or strings are fine.
+// Returns -1 when the path is not in the answer or the value is no array.
+// ===========================================================================
+FUNCTION F_WdaCountItems : INT
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;
+    udiLen  : UDINT;
+    sPath   : STRING(60);
+END_VAR
+VAR
+    diPos   : DINT;
+    i       : UDINT;
+    iDepth  : INT;
+    iCommas : INT;
+    xAny    : BOOL;
+    c       : BYTE;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_WdaCountItems := -1;
+diPos := F_WdaValuePos(pBuf, udiLen, sPath);
+IF diPos < 0 THEN
+    RETURN;
+END_IF
+i := TO_UDINT(diPos);
+WHILE (i < udiLen) AND (pBuf[i] = 32) DO               // spaces
+    i := i + 1;
+END_WHILE
+IF (i >= udiLen) OR (pBuf[i] <> 91) THEN               // '['
+    RETURN;
+END_IF
+i := i + 1;
+WHILE i < udiLen DO
+    c := pBuf[i];
+    IF c = 34 THEN                                     // '"': skip the string
+        xAny := TRUE;
+        i := i + 1;
+        WHILE (i < udiLen) AND (pBuf[i] <> 34) DO
+            IF pBuf[i] = 92 THEN i := i + 1; END_IF     // '\' escapes the next byte
+            i := i + 1;
+        END_WHILE
+    ELSIF (c = 91) OR (c = 123) THEN                   // '[' '{'
+        xAny := TRUE;
+        iDepth := iDepth + 1;
+    ELSIF (c = 93) OR (c = 125) THEN                   // ']' '}'
+        IF iDepth = 0 THEN
+            EXIT;
+        END_IF
+        iDepth := iDepth - 1;
+    ELSIF (c = 44) AND (iDepth = 0) THEN               // ','
+        iCommas := iCommas + 1;
+    ELSIF c > 32 THEN
+        xAny := TRUE;
+    END_IF
+    i := i + 1;
+END_WHILE
+IF xAny THEN
+    F_WdaCountItems := iCommas + 1;
+ELSE
+    F_WdaCountItems := 0;
+END_IF
+=== END OF F_WdaCountItems ===
+
+=== OBJECT 6/14: F_WdaParseBools  (POU, Function, return type INT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_WdaParseBools  -  boolean array value of one parameter -> ARRAY OF BOOL
+// Object type in CODESYS: POU, Function, return type INT, language ST
+// Uses: F_WdaValuePos, F_FindBytes
+//
+// "value":[true,false,true] -> pDst[0..2]. At most uiMax items are stored.
+// Returns the number of items in the answer, or -1 when the path is missing.
+// Call: F_WdaParseBools(p, n, 'KBus/DigitalInputValues', ADR(axDI), SIZEOF(axDI))
+// ===========================================================================
+FUNCTION F_WdaParseBools : INT
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;
+    udiLen  : UDINT;
+    sPath   : STRING(60);
+    pDst    : POINTER TO BOOL;      // first element of the destination array
+    uiMax   : UINT;                 // number of elements of the destination array
+END_VAR
+VAR
+    diPos   : DINT;
+    i       : UDINT;
+    uiIdx   : UINT;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_WdaParseBools := -1;
+diPos := F_WdaValuePos(pBuf, udiLen, sPath);
+IF diPos < 0 THEN
+    RETURN;
+END_IF
+i := TO_UDINT(diPos);
+WHILE (i < udiLen) AND (pBuf[i] <> 91) DO              // up to '['
+    i := i + 1;
+END_WHILE
+i := i + 1;
+WHILE (i < udiLen) AND (pBuf[i] <> 93) DO              // up to ']'
+    IF (pBuf[i] = 116) OR (pBuf[i] = 102) THEN         // 't' / 'f'
+        IF uiIdx < uiMax THEN
+            pDst[uiIdx] := (pBuf[i] = 116);
+        END_IF
+        uiIdx := uiIdx + 1;
+        IF pBuf[i] = 116 THEN i := i + 4; ELSE i := i + 5; END_IF
+    ELSE
+        i := i + 1;                                    // ',' or space
+    END_IF
+END_WHILE
+F_WdaParseBools := TO_INT(uiIdx);
+=== END OF F_WdaParseBools ===
+
+=== OBJECT 7/14: F_WdaParseUints  (POU, Function, return type INT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_WdaParseUints  -  uint16 array value of one parameter -> ARRAY OF UINT
+// Object type in CODESYS: POU, Function, return type INT, language ST
+// Uses: F_WdaValuePos, F_FindBytes
+//
+// "value":[0,16384,32767] -> pDst[0..2]. At most uiMax items are stored.
+// Returns the number of items in the answer, or -1 when the path is missing.
+// Call: F_WdaParseUints(p, n, 'KBus/AnalogInputValues', ADR(auiAI), SIZEOF(auiAI) / 2)
+// ===========================================================================
+FUNCTION F_WdaParseUints : INT
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;
+    udiLen  : UDINT;
+    sPath   : STRING(60);
+    pDst    : POINTER TO UINT;      // first element of the destination array
+    uiMax   : UINT;                 // number of elements of the destination array
+END_VAR
+VAR
+    diPos   : DINT;
+    i       : UDINT;
+    uiIdx   : UINT;
+    udiVal  : UDINT;
+    xDigits : BOOL;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_WdaParseUints := -1;
+diPos := F_WdaValuePos(pBuf, udiLen, sPath);
+IF diPos < 0 THEN
+    RETURN;
+END_IF
+i := TO_UDINT(diPos);
+WHILE (i < udiLen) AND (pBuf[i] <> 91) DO              // up to '['
+    i := i + 1;
+END_WHILE
+i := i + 1;
+WHILE i < udiLen DO
+    IF (pBuf[i] >= 48) AND (pBuf[i] <= 57) THEN        // '0'..'9'
+        udiVal := udiVal * 10 + (pBuf[i] - 48);
+        xDigits := TRUE;
+    ELSIF (pBuf[i] = 44) OR (pBuf[i] = 93) THEN        // ',' or ']'
+        IF xDigits THEN
+            IF uiIdx < uiMax THEN
+                pDst[uiIdx] := UDINT_TO_UINT(udiVal);
+            END_IF
+            uiIdx := uiIdx + 1;
+        END_IF
+        udiVal := 0;
+        xDigits := FALSE;
+        IF pBuf[i] = 93 THEN
+            EXIT;
+        END_IF
+    END_IF
+    i := i + 1;
+END_WHILE
+F_WdaParseUints := TO_INT(uiIdx);
+=== END OF F_WdaParseUints ===
+
+=== OBJECT 8/14: F_WdaParseScalar  (POU, Function, return type LINT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_WdaParseScalar  -  boolean or unsigned integer value of one parameter
+// Object type in CODESYS: POU, Function, return type LINT, language ST
+// Uses: F_WdaValuePos, F_FindBytes
+//
+// "value":true -> 1, "value":false -> 0, "value":123 -> 123.
+// Returns -1 when the path is missing or the value is neither.
+// ===========================================================================
+FUNCTION F_WdaParseScalar : LINT
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;
+    udiLen  : UDINT;
+    sPath   : STRING(60);
+END_VAR
+VAR
+    diPos   : DINT;
+    i       : UDINT;
+    liVal   : LINT;
+    xDigits : BOOL;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_WdaParseScalar := -1;
+diPos := F_WdaValuePos(pBuf, udiLen, sPath);
+IF diPos < 0 THEN
+    RETURN;
+END_IF
+i := TO_UDINT(diPos);
+WHILE (i < udiLen) AND (pBuf[i] = 32) DO
+    i := i + 1;
+END_WHILE
+IF i >= udiLen THEN
+    RETURN;
+ELSIF pBuf[i] = 116 THEN                               // true
+    F_WdaParseScalar := 1;
+ELSIF pBuf[i] = 102 THEN                               // false
+    F_WdaParseScalar := 0;
+ELSE
+    WHILE (i < udiLen) AND (pBuf[i] >= 48) AND (pBuf[i] <= 57) DO
+        liVal := liVal * 10 + (pBuf[i] - 48);
+        xDigits := TRUE;
+        i := i + 1;
+    END_WHILE
+    IF xDigits THEN
+        F_WdaParseScalar := liVal;
+    END_IF
+END_IF
+=== END OF F_WdaParseScalar ===
+
+=== OBJECT 9/14: F_WdaDecodeBytes  (POU, Function, return type INT, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// F_WdaDecodeBytes  -  JSON string value of one parameter -> bytes
+// Object type in CODESYS: POU, Function, return type INT, language ST
+// Uses: F_WdaValuePos, F_FindBytes
+//
+// For byte strings of the gateway (Serial/Com1/RxFrame, RxData, Format): one
+// character per byte, printable ASCII as is, every other byte as \u00XX.
+// "value":"AB\u000d\u000a" -> pDst[0..3] = 65, 66, 13, 10. At most uiMax bytes
+// are stored. Returns the number of bytes, or -1 when the path is missing.
+// ===========================================================================
+FUNCTION F_WdaDecodeBytes : INT
+VAR_INPUT
+    pBuf    : POINTER TO BYTE;
+    udiLen  : UDINT;
+    sPath   : STRING(60);
+    pDst    : POINTER TO BYTE;      // first element of the destination array
+    uiMax   : UINT;                 // size of the destination array
+END_VAR
+VAR
+    diPos   : DINT;
+    i       : UDINT;
+    j       : UDINT;
+    uiN     : UINT;
+    c       : BYTE;
+    b       : BYTE;
+    uiV     : UINT;
+    h       : BYTE;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+F_WdaDecodeBytes := -1;
+diPos := F_WdaValuePos(pBuf, udiLen, sPath);
+IF diPos < 0 THEN
+    RETURN;
+END_IF
+i := TO_UDINT(diPos);
+WHILE (i < udiLen) AND (pBuf[i] <> 34) DO              // up to the opening '"'
+    i := i + 1;
+END_WHILE
+i := i + 1;
+WHILE (i < udiLen) AND (pBuf[i] <> 34) DO              // up to the closing '"'
+    c := pBuf[i];
+    b := c;
+    i := i + 1;
+    IF (c = 92) AND (i < udiLen) THEN                  // '\' escape
+        c := pBuf[i];
+        i := i + 1;
+        CASE c OF
+        110: b := 10;                                  // \n
+        114: b := 13;                                  // \r
+        116: b := 9;                                   // \t
+        98:  b := 8;                                   // \b
+        102: b := 12;                                  // \f
+        117:                                           // \uXXXX (gateway: <= 00FF)
+            uiV := 0;
+            FOR j := 0 TO 3 DO
+                IF i < udiLen THEN
+                    h := pBuf[i];
+                    IF (h >= 48) AND (h <= 57) THEN uiV := uiV * 16 + (h - 48);
+                    ELSIF (h >= 97) AND (h <= 102) THEN uiV := uiV * 16 + (h - 87);
+                    ELSIF (h >= 65) AND (h <= 70) THEN uiV := uiV * 16 + (h - 55);
+                    END_IF
+                    i := i + 1;
+                END_IF
+            END_FOR
+            b := UINT_TO_BYTE(uiV);
+        ELSE
+            b := c;                                    // \" \\ \/
+        END_CASE
+    END_IF
+    IF uiN < uiMax THEN
+        pDst[uiN] := b;
+    END_IF
+    uiN := uiN + 1;
+END_WHILE
+F_WdaDecodeBytes := TO_INT(MIN(uiN, uiMax));
+=== END OF F_WdaDecodeBytes ===
+
+=== OBJECT 10/14: FB_HttpTransaction  (POU, Function Block, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// FB_HttpTransaction  -  ONE HTTP request (byte based, fast completion)
+// Object type in CODESYS: POU, Function Block, language ST
+// Library: CAA Net Base Services (namespace NBS) + Standard
+//
+// Flow: connect -> send the complete request in ONE TCP write -> receive ->
+// status code + body position. Speed:
+//   - several stages run in the SAME task cycle where the library allows it
+//     (connected -> send at once, sent -> read at once, complete -> parse)
+//   - the answer is complete as soon as Content-Length bytes of body arrived
+//     (the wdx interface always sends Content-Length); otherwise when the
+//     server closes the connection, or 20 ms after the last data
+//
+// Gateway rules this FB respects:
+//   - the gateway reads ONCE: the request must be one TCP write
+//   - one client at a time: never run two transactions in parallel
+//
+// Usage: set pRequest/udiRequestLen, rising edge on xExecute, wait for xDone
+//        or xError, then xExecute := FALSE (a FALSE->TRUE in the same cycle
+//        starts the next request immediately).
+// ===========================================================================
+FUNCTION_BLOCK FB_HttpTransaction
+VAR_INPUT
+    xExecute      : BOOL;
+    sHost         : STRING(15) := GVL_KbusRest.gc_sGatewayHost;
+    uiPort        : UINT       := GVL_KbusRest.gc_uiGatewayPort;
+    pRequest      : POINTER TO BYTE;
+    udiRequestLen : UDINT;
+    tTimeout      : TIME := T#1S;
+END_VAR
+VAR_OUTPUT
+    xBusy         : BOOL;
+    xDone         : BOOL;                                // valid HTTP answer (any status)
+    xError        : BOOL;                                // no valid answer
+    iStatus       : INT;                                 // 200, 204, 4xx; 0 = no answer
+    pBody         : POINTER TO BYTE;
+    udiBodyLen    : UDINT;
+    sErrorText    : STRING(80);
+END_VAR
+VAR
+    fbConn        : NBS.TCP_Connection;
+    fbWrite       : NBS.TCP_Write;
+    fbRead        : NBS.TCP_Read;
+    ipAddr        : NBS.IP_ADDR;
+    rtExecute     : R_TRIG;
+    fbTimeout     : TON;
+    fbIdle        : TON;
+    iState        : INT;
+    iPrev         : INT;
+    iLoop         : INT;
+    abChunk       : ARRAY[0..1023] OF BYTE;
+    abRx          : ARRAY[0..8191] OF BYTE;              // 8 KB: a full WDA answer with stringValue and links
+    udiRx         : UDINT;
+    diHdrEnd      : DINT;                                // position of CR LF CR LF, -1 = not yet
+    diCLen        : DINT;                                // Content-Length, -1 = none
+    diPos         : DINT;
+    sHead         : STRING(80);
+    pHead         : POINTER TO BYTE;
+    i             : UDINT;
+    udiMax        : UDINT;
+    xComplete     : BOOL;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+rtExecute(CLK := xExecute);
+
+// up to 4 stages per call: no task cycle is wasted between finished stages
+FOR iLoop := 1 TO 4 DO
+    iPrev := iState;
+    CASE iState OF
+    0:  // idle
+        IF rtExecute.Q THEN
+            xBusy := TRUE; xDone := FALSE; xError := FALSE;
+            iStatus := 0; pBody := ADR(abRx); udiBodyLen := 0; sErrorText := '';
+            udiRx := 0; diHdrEnd := -1; diCLen := -1;
+            ipAddr.sAddr := sHost;
+            IF (pRequest = 0) OR (udiRequestLen = 0) THEN
+                sErrorText := 'no request';
+                iState := 99;
+            ELSE
+                iState := 10;
+            END_IF
+        END_IF
+
+    10: // connect
+        fbConn(xEnable := TRUE, ipAddr := ipAddr, uiPort := uiPort);
+        IF fbConn.xActive THEN
+            iState := 20;
+        ELSIF fbConn.xError THEN
+            sErrorText := 'connect failed (gateway running? port?)';
+            iState := 99;
+        END_IF
+
+    20: // send the whole request in ONE write
+        fbConn(xEnable := TRUE, ipAddr := ipAddr, uiPort := uiPort);
+        fbWrite(xExecute := TRUE, hConnection := fbConn.hConnection,
+                szSize := udiRequestLen, pData := pRequest);
+        IF fbWrite.xDone THEN
+            fbWrite(xExecute := FALSE);
+            iState := 30;
+        ELSIF fbWrite.xError THEN
+            fbWrite(xExecute := FALSE);
+            sErrorText := 'send failed';
+            iState := 99;
+        END_IF
+
+    30: // receive
+        fbConn(xEnable := TRUE, ipAddr := ipAddr, uiPort := uiPort);
+        fbRead(xEnable := TRUE, hConnection := fbConn.hConnection,
+               szSize := SIZEOF(abChunk), pData := ADR(abChunk));
+        IF fbRead.xReady AND fbRead.szCount > 0 THEN
+            FOR i := 0 TO TO_UDINT(fbRead.szCount) - 1 DO   // szCount is CAA.SIZE (64 bit on ARM64)
+                IF udiRx < SIZEOF(abRx) THEN
+                    abRx[udiRx] := abChunk[i];
+                    udiRx := udiRx + 1;
+                END_IF
+            END_FOR
+            fbIdle(IN := FALSE);
+            // header complete? then read Content-Length once
+            IF diHdrEnd < 0 THEN
+                diHdrEnd := F_FindBytes(ADR(abRx), udiRx, 0, '$R$N$R$N');
+                IF diHdrEnd >= 0 THEN
+                    diPos := F_FindBytes(ADR(abRx), TO_UDINT(diHdrEnd), 0, 'Content-Length: ');
+                    IF diPos >= 0 THEN
+                        diCLen := 0;
+                        i := TO_UDINT(diPos) + 16;
+                        WHILE (i < udiRx) AND (abRx[i] >= 48) AND (abRx[i] <= 57) DO
+                            diCLen := diCLen * 10 + (abRx[i] - 48);
+                            i := i + 1;
+                        END_WHILE
+                    END_IF
+                END_IF
+            END_IF
+        END_IF
+        xComplete := (diHdrEnd >= 0) AND (diCLen >= 0) AND (TO_DINT(udiRx) >= diHdrEnd + 4 + diCLen);
+        fbIdle(IN := udiRx > 0, PT := T#20MS);
+        IF xComplete OR ((udiRx > 0) AND (fbRead.xError OR NOT fbConn.xActive OR fbIdle.Q)) THEN
+            iState := 40;
+        ELSIF (udiRx = 0) AND (fbRead.xError OR NOT fbConn.xActive) THEN
+            sErrorText := 'connection closed without answer';
+            iState := 99;
+        END_IF
+
+    40: // parse status line and body position, close
+        udiMax := MIN(udiRx, 80);
+        pHead := ADR(sHead);
+        FOR i := 0 TO udiMax - 1 DO
+            pHead[i] := abRx[i];
+        END_FOR
+        pHead[udiMax] := 0;
+        IF FIND(sHead, 'HTTP/1.') = 1 AND LEN(sHead) >= 12 THEN
+            iStatus := STRING_TO_INT(MID(sHead, 3, 10));    // 'HTTP/1.0 200 OK' -> '200'
+        END_IF
+        IF diHdrEnd < 0 THEN
+            diHdrEnd := F_FindBytes(ADR(abRx), udiRx, 0, '$R$N$R$N');
+        END_IF
+        IF diHdrEnd >= 0 THEN
+            pBody := ADR(abRx[diHdrEnd + 4]);
+            udiBodyLen := udiRx - TO_UDINT(diHdrEnd + 4);
+        END_IF
+        fbRead(xEnable := FALSE, hConnection := fbConn.hConnection);
+        fbConn(xEnable := FALSE);
+        fbIdle(IN := FALSE);
+        xBusy := FALSE;
+        IF iStatus > 0 THEN
+            xDone := TRUE;
+        ELSE
+            xError := TRUE;
+            sErrorText := 'no valid HTTP answer';
+        END_IF
+        iState := 0;
+
+    99: // error: close everything
+        fbWrite(xExecute := FALSE);
+        fbRead(xEnable := FALSE, hConnection := fbConn.hConnection);
+        fbConn(xEnable := FALSE);
+        fbIdle(IN := FALSE);
+        xBusy := FALSE;
+        xError := TRUE;
+        iState := 0;
+    END_CASE
+
+    // stop when nothing changed (waiting for the network) or finished
+    IF (iState = iPrev) OR (iState = 0) THEN
+        EXIT;
+    END_IF
+END_FOR
+
+// overall time-out (also releases the gateway, which serves one client at a time)
+fbTimeout(IN := (iState >= 10) AND (iState < 40), PT := tTimeout);
+IF fbTimeout.Q THEN
+    sErrorText := 'timeout';
+    fbWrite(xExecute := FALSE);
+    fbRead(xEnable := FALSE, hConnection := fbConn.hConnection);
+    fbConn(xEnable := FALSE);
+    xBusy := FALSE;
+    xError := TRUE;
+    iState := 0;
+END_IF
+=== END OF FB_HttpTransaction ===
+
+=== OBJECT 11/14: FB_WdaKbusIo  (POU, Function Block, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// FB_WdaKbusIo  -  cyclic KBus I/O through the WDA REST-API of kbus-gateway
+// Object type in CODESYS: POU, Function Block, language ST
+// Uses: FB_HttpTransaction, F_AppendStr, F_FindBytes, F_WdaValuePos,
+//       F_WdaCountItems, F_WdaParseBools, F_WdaParseUints, F_WdaParseScalar,
+//       GVL_KbusRest
+// Needs kbus-gateway 2.4.0 or newer (WDA REST-API 1.11.0: filter[path], batch
+// PATCH with one error object per parameter).
+//
+// Only standard WDA requests (manual chapters 6 and 9):
+//   discover  GET   /wda/parameters?filter[path]=KBus/ConfigurationVersion,
+//                   KBus/DigitalInputs,KBus/DigitalOutputs,KBus/AnalogInputs,
+//                   KBus/AnalogOutputs                                     -> 200
+//             the channel counts = number of items of the instantiations
+//   write     PATCH /wda/parameters  {"data":[DO array, AO array]}         -> 204
+//             only when an output changed, after an error, or every tRefresh
+//   read      GET   /wda/parameters?filter[path]=KBus/Healthy,
+//                   KBus/ConfigurationVersion,KBus/<class>Values (4x)      -> 200
+//             all inputs and the confirmed outputs from ONE KBus snapshot
+// A new KBus/ConfigurationVersion (modules added or removed, rescan) starts
+// a new discovery automatically.
+// Local control (KBus/LocalControl, switched in the dashboard after its login):
+// the FB pauses its writes (xLocalControl = TRUE), keeps reading, and sends all
+// outputs again as soon as local control is released.
+//
+// Timing: an exchange starts every tInterval (start to start, default 5 ms);
+// write and read run in the same task cycle when possible. Use a cyclic task
+// of 1 ms (2 ms at most) for tInterval = 5 ms. tLastExchange / tMaxExchange
+// show what the exchange really needs.
+//
+// Usage:
+//   fbIo(xEnable := TRUE);              axDOSet / auiAOSet in, axDI / auiAI out
+//   fbIo.uiNumDI .. uiNumAO             channel counts read from the gateway
+// ===========================================================================
+FUNCTION_BLOCK FB_WdaKbusIo
+VAR_INPUT
+    xEnable       : BOOL;
+    sHost         : STRING(15) := GVL_KbusRest.gc_sGatewayHost;
+    uiPort        : UINT       := GVL_KbusRest.gc_uiGatewayPort;
+    tInterval     : TIME := T#5MS;                       // start to start of two exchanges
+    tRefresh      : TIME := T#1S;                        // outputs are sent at least this often
+    tTimeout      : TIME := T#200MS;                     // per request
+    axDOSet       : ARRAY[1..GVL_KbusRest.gc_uiMaxDigital] OF BOOL;  // desired DO
+    auiAOSet      : ARRAY[1..GVL_KbusRest.gc_uiMaxAnalog]  OF UINT;  // desired AO (raw)
+END_VAR
+VAR_OUTPUT
+    axDI          : ARRAY[1..GVL_KbusRest.gc_uiMaxDigital] OF BOOL;
+    auiAI         : ARRAY[1..GVL_KbusRest.gc_uiMaxAnalog]  OF UINT;
+    axDO          : ARRAY[1..GVL_KbusRest.gc_uiMaxDigital] OF BOOL;  // confirmed by the gateway
+    auiAO         : ARRAY[1..GVL_KbusRest.gc_uiMaxAnalog]  OF UINT;  // confirmed by the gateway
+    uiNumDI       : UINT;                                // channel counts of the gateway
+    uiNumDO       : UINT;                                //   (limited to the array sizes)
+    uiNumAI       : UINT;
+    uiNumAO       : UINT;
+    xReady        : BOOL;                                // channel counts known, values valid
+    xHealthy      : BOOL;                                // KBus/Healthy
+    xLocalControl : BOOL;                                // KBus/LocalControl: the dashboard controls the KBUS,
+                                                         //   axDOSet / auiAOSet are not written meanwhile
+    xOnline       : BOOL;                                // FALSE after 3 failed requests in a row
+    udiConfigVersion : UDINT;                            // KBus/ConfigurationVersion
+    udiExchanges  : UDINT;
+    udiWrites     : UDINT;
+    udiErrors     : UDINT;
+    tLastExchange : TIME;                                // duration of the last exchange
+    tMaxExchange  : TIME;                                // longest exchange (xEnable FALSE resets)
+    iLastStatus   : INT;                                 // HTTP status of the last request
+    iLastWdaCode  : INT;                                 // WDA status code of the last error (0 = none)
+    sLastError    : STRING(80);
+END_VAR
+VAR
+    fbHttp        : FB_HttpTransaction;
+    abTx          : ARRAY[0..2047] OF BYTE;
+    abBody        : ARRAY[0..1279] OF BYTE;
+    udiTx         : UDINT;
+    udiBody       : UDINT;
+    iState        : INT;                                 // 0 wait, 1 discover, 2 write, 3 read
+    iExpected     : INT;                                 // -1 = request still to build
+    iPass         : INT;
+    xWrite        : BOOL;
+    xForceWrite   : BOOL := TRUE;
+    axDOSent      : ARRAY[1..GVL_KbusRest.gc_uiMaxDigital] OF BOOL;
+    auiAOSent     : ARRAY[1..GVL_KbusRest.gc_uiMaxAnalog]  OF UINT;
+    tStart        : TIME;
+    tLastWrite    : TIME;
+    uiErrStreak   : UINT;
+    i             : UINT;
+    j             : UDINT;
+    p             : POINTER TO BYTE;
+    udiN          : UDINT;
+    diPos         : DINT;
+    iCount        : INT;
+    liVal         : LINT;
+    pErr          : POINTER TO BYTE;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+IF NOT xEnable THEN
+    fbHttp(xExecute := FALSE);
+    xOnline := FALSE;
+    xReady := FALSE;
+    xForceWrite := TRUE;
+    tMaxExchange := T#0MS;
+    iState := 0;
+    RETURN;
+END_IF
+
+// ---------------------------------------------------------------- start
+IF iState = 0 THEN
+    IF (uiErrStreak > 0) AND (TIME() - tStart < MAX(tInterval, T#100MS)) THEN
+        ;                                                 // after an error: at most 10 tries per second
+    ELSIF NOT xReady THEN
+        tStart := TIME();
+        iState := 1;
+    ELSIF TIME() - tStart >= tInterval THEN
+        tStart := TIME();
+        xWrite := xForceWrite OR (TIME() - tLastWrite >= tRefresh);
+        FOR i := 1 TO uiNumDO DO
+            xWrite := xWrite OR (axDOSet[i] <> axDOSent[i]);
+        END_FOR
+        FOR i := 1 TO uiNumAO DO
+            xWrite := xWrite OR (auiAOSet[i] <> auiAOSent[i]);
+        END_FOR
+        IF xWrite AND (uiNumDO + uiNumAO > 0) AND NOT xLocalControl THEN iState := 2; ELSE iState := 3; END_IF
+    END_IF
+    iExpected := -1;
+END_IF
+
+// up to 3 requests per task cycle: a step starts as soon as the previous one finished
+FOR iPass := 1 TO 3 DO
+IF iState = 0 THEN
+    EXIT;
+END_IF
+
+// ---------------------------------------------------------------- build request
+IF iExpected = -1 THEN
+    udiTx := 0;
+    CASE iState OF
+    1:  // discover: channel counts and configuration version
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'GET /wda/parameters?filter[path]=KBus/ConfigurationVersion,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'KBus/DigitalInputs,KBus/DigitalOutputs,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'KBus/AnalogInputs,KBus/AnalogOutputs HTTP/1.0$R$N$R$N', udiTx);
+        iExpected := 200;
+    2:  // write: one batch PATCH with the DO and the AO array (all or nothing)
+        udiBody := 0;
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"data":[', udiBody);
+        IF uiNumDO > 0 THEN
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"type":"parameters","id":"0-0-kbus-digitaloutputvalues",', udiBody);
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '"attributes":{"value":[', udiBody);
+            FOR i := 1 TO uiNumDO DO
+                IF i > 1 THEN F_AppendStr(ADR(abBody), SIZEOF(abBody), ',', udiBody); END_IF
+                IF axDOSet[i] THEN F_AppendStr(ADR(abBody), SIZEOF(abBody), 'true', udiBody);
+                ELSE               F_AppendStr(ADR(abBody), SIZEOF(abBody), 'false', udiBody);
+                END_IF
+                axDOSent[i] := axDOSet[i];
+            END_FOR
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), ']}}', udiBody);
+        END_IF
+        IF uiNumAO > 0 THEN
+            IF uiNumDO > 0 THEN F_AppendStr(ADR(abBody), SIZEOF(abBody), ',', udiBody); END_IF
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"type":"parameters","id":"0-0-kbus-analogoutputvalues",', udiBody);
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '"attributes":{"value":[', udiBody);
+            FOR i := 1 TO uiNumAO DO
+                IF i > 1 THEN F_AppendStr(ADR(abBody), SIZEOF(abBody), ',', udiBody); END_IF
+                F_AppendStr(ADR(abBody), SIZEOF(abBody), UINT_TO_STRING(auiAOSet[i]), udiBody);
+                auiAOSent[i] := auiAOSet[i];
+            END_FOR
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), ']}}', udiBody);
+        END_IF
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), ']}', udiBody);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'PATCH /wda/parameters HTTP/1.0$R$N', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'Content-Type: application/vnd.api+json$R$N', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), CONCAT(CONCAT('Content-Length: ', UDINT_TO_STRING(udiBody)), '$R$N$R$N'), udiTx);
+        j := 0;
+        WHILE (j < udiBody) AND (udiTx < SIZEOF(abTx)) DO  // header and body in ONE TCP write
+            abTx[udiTx] := abBody[j];
+            udiTx := udiTx + 1;
+            j := j + 1;
+        END_WHILE
+        iExpected := 204;
+    3:  // read: all value arrays in ONE request (one KBus snapshot)
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'GET /wda/parameters?filter[path]=KBus/Healthy,KBus/ConfigurationVersion,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'KBus/LocalControl,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'KBus/DigitalInputValues,KBus/DigitalOutputValues,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'KBus/AnalogInputValues,KBus/AnalogOutputValues HTTP/1.0$R$N$R$N', udiTx);
+        iExpected := 200;
+    END_CASE
+    fbHttp.pRequest := ADR(abTx);
+    fbHttp.udiRequestLen := udiTx;
+    fbHttp(xExecute := FALSE);                            // FALSE -> TRUE in the same cycle:
+END_IF                                                    // the request starts at once
+
+// ---------------------------------------------------------------- run request
+fbHttp(xExecute := TRUE, sHost := sHost, uiPort := uiPort, tTimeout := tTimeout);
+IF NOT (fbHttp.xDone OR fbHttp.xError) THEN
+    EXIT;                                                 // still running: continue next cycle
+END_IF
+iLastStatus := fbHttp.iStatus;
+p := fbHttp.pBody;
+udiN := fbHttp.udiBodyLen;
+fbHttp(xExecute := FALSE);
+
+IF fbHttp.xDone AND (iLastStatus = iExpected) THEN
+    CASE iState OF
+    1:  // channel counts = items of the instantiations
+        iCount := F_WdaCountItems(p, udiN, 'KBus/DigitalInputs');
+        uiNumDI := MIN(TO_UINT(MAX(iCount, 0)), GVL_KbusRest.gc_uiMaxDigital);
+        iCount := F_WdaCountItems(p, udiN, 'KBus/DigitalOutputs');
+        uiNumDO := MIN(TO_UINT(MAX(iCount, 0)), GVL_KbusRest.gc_uiMaxDigital);
+        iCount := F_WdaCountItems(p, udiN, 'KBus/AnalogInputs');
+        uiNumAI := MIN(TO_UINT(MAX(iCount, 0)), GVL_KbusRest.gc_uiMaxAnalog);
+        iCount := F_WdaCountItems(p, udiN, 'KBus/AnalogOutputs');
+        uiNumAO := MIN(TO_UINT(MAX(iCount, 0)), GVL_KbusRest.gc_uiMaxAnalog);
+        liVal := F_WdaParseScalar(p, udiN, 'KBus/ConfigurationVersion');
+        udiConfigVersion := LINT_TO_UDINT(MAX(liVal, 0));
+        xReady := TRUE;
+        xForceWrite := TRUE;
+        IF (uiNumDO + uiNumAO > 0) AND NOT xLocalControl THEN iState := 2; ELSE iState := 3; END_IF   // first exchange at once
+        iExpected := -1;
+    2:  // outputs written
+        udiWrites := udiWrites + 1;
+        tLastWrite := TIME();
+        xForceWrite := FALSE;
+        iState := 3;
+        iExpected := -1;
+    3:  // inputs and confirmed outputs
+        F_WdaParseBools(p, udiN, 'KBus/DigitalInputValues',  ADR(axDI), GVL_KbusRest.gc_uiMaxDigital);
+        F_WdaParseBools(p, udiN, 'KBus/DigitalOutputValues', ADR(axDO), GVL_KbusRest.gc_uiMaxDigital);
+        F_WdaParseUints(p, udiN, 'KBus/AnalogInputValues',   ADR(auiAI), GVL_KbusRest.gc_uiMaxAnalog);
+        F_WdaParseUints(p, udiN, 'KBus/AnalogOutputValues',  ADR(auiAO), GVL_KbusRest.gc_uiMaxAnalog);
+        xHealthy := F_WdaParseScalar(p, udiN, 'KBus/Healthy') = 1;
+        xLocalControl := F_WdaParseScalar(p, udiN, 'KBus/LocalControl') = 1;
+        IF xLocalControl THEN
+            xForceWrite := TRUE;                          // after the release: send all outputs at once
+        END_IF
+        liVal := F_WdaParseScalar(p, udiN, 'KBus/ConfigurationVersion');
+        IF (liVal >= 0) AND (LINT_TO_UDINT(liVal) <> udiConfigVersion) THEN
+            xReady := FALSE;                              // modules changed: discover again
+        END_IF
+        udiExchanges := udiExchanges + 1;
+        tLastExchange := TIME() - tStart;
+        tMaxExchange := MAX(tMaxExchange, tLastExchange);
+        uiErrStreak := 0;
+        xOnline := TRUE;
+        iLastWdaCode := 0;
+        iState := 0;
+    END_CASE
+ELSIF fbHttp.xDone AND (iState = 2) AND (iLastStatus = 403) AND (F_FindBytes(p, udiN, 0, 'local control') >= 0) THEN
+    // local control was switched on just now: not an error, read on
+    xLocalControl := TRUE;
+    xForceWrite := TRUE;
+    iState := 3;
+    iExpected := -1;
+ELSE
+    // 400 = rejected (WDA code in iLastWdaCode, e.g. 39 more values than channels),
+    // 403 = writes disabled (57), 404 = gateway without WDA, xError = network
+    udiErrors := udiErrors + 1;
+    uiErrStreak := uiErrStreak + 1;
+    xOnline := uiErrStreak < 3;
+    iLastWdaCode := 0;
+    IF fbHttp.xDone THEN
+        sLastError := CONCAT('HTTP ', INT_TO_STRING(iLastStatus));
+        diPos := F_FindBytes(p, udiN, 0, '"code":"');
+        IF diPos >= 0 THEN
+            j := TO_UDINT(diPos) + 8;
+            WHILE (j < udiN) AND (p[j] >= 48) AND (p[j] <= 57) DO
+                iLastWdaCode := iLastWdaCode * 10 + (p[j] - 48);
+                j := j + 1;
+            END_WHILE
+        END_IF
+        diPos := F_FindBytes(p, udiN, 0, '"detail":"');   // first error: copy its detail
+        IF diPos >= 0 THEN
+            pErr := ADR(sLastError);
+            j := 0;
+            WHILE (TO_UDINT(diPos) + 10 + j < udiN) AND (j < 79) AND (p[TO_UDINT(diPos) + 10 + j] <> 34) DO
+                pErr[j] := p[TO_UDINT(diPos) + 10 + j];
+                j := j + 1;
+            END_WHILE
+            pErr[j] := 0;
+        END_IF
+    ELSE
+        sLastError := fbHttp.sErrorText;
+    END_IF
+    xReady := FALSE;                                      // discover again (gateway restart, rescan)
+    xForceWrite := TRUE;                                  // and send the outputs again
+    iState := 0;
+END_IF
+END_FOR
+=== END OF FB_WdaKbusIo ===
+
+=== OBJECT 12/14: FB_WdaSerial  (POU, Function Block, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// FB_WdaSerial  -  COM1 of the controller through the WDA REST-API of kbus-gateway
+// Object type in CODESYS: POU, Function Block, language ST
+// Uses: FB_HttpTransaction, F_AppendStr, F_FindBytes, F_WdaValuePos,
+//       F_WdaParseScalar, F_WdaDecodeBytes, GVL_KbusRest
+// Needs kbus-gateway 2.5.0 or newer (Serial/Com1/...).
+//
+// The gateway forwards COM1 transparently; the protocol is made here.
+// Settings (baud rate, format, frame gap): udiSetBaudrate / sSetFormat /
+// uiSetFrameGap (0 / '' = keep the value stored in the gateway). The FB writes
+// them only when they differ from the current ones: after the start and
+// whenever the inputs change. The current settings are always in udiBaudrate /
+// sFormat / uiFrameGap; the KBUS dashboard (Settings > COM1) shows them.
+//
+//   settings  PATCH /wda/parameters  {"data":[baudrate, format, framegap]} -> 204
+//   send      PATCH /wda/parameters/0-0-serial-com1-transmit       -> 204
+//             rising edge on xSend: abTxData[0..uiTxLen-1], or sTxData when uiTxLen = 0
+//   receive   GET   /wda/parameters?filter[path]=Serial/Com1/...    -> 200, every tPoll
+//             a new frame (RxFrameCount changed): xNewFrame for one call,
+//             abFrame[0..uiFrameLen-1] / sFrame
+// A frame is what arrived without a pause of FrameGap ms in between.
+// ===========================================================================
+FUNCTION_BLOCK FB_WdaSerial
+VAR_INPUT
+    xEnable       : BOOL;
+    sHost         : STRING(15) := GVL_KbusRest.gc_sGatewayHost;
+    uiPort        : UINT       := GVL_KbusRest.gc_uiGatewayPort;
+    tPoll         : TIME := T#20MS;                      // receive: one GET per tPoll
+    tTimeout      : TIME := T#500MS;                     // per request
+    xSend         : BOOL;                                // rising edge: send
+    sTxData       : STRING(255);                         // text to send (when uiTxLen = 0)
+    abTxData      : ARRAY[0..255] OF BYTE;               // bytes to send (binary)
+    uiTxLen       : UINT;                                // 0 = send sTxData
+    udiSetBaudrate : UDINT;                              // 1200..230400; 0 = keep the current one
+    sSetFormat    : STRING(3);                           // e.g. '8E1' (data bits, parity N/E/O, stop bits); '' = keep
+    uiSetFrameGap : UINT;                                // 1..1000 ms; 0 = keep
+END_VAR
+VAR_OUTPUT
+    xOpen         : BOOL;                                // Serial/Com1/Open: port open in the gateway
+    udiBaudrate   : UDINT;                               // current settings (read from the gateway)
+    sFormat       : STRING(3);                           //   e.g. '8E1'
+    uiFrameGap    : UINT;                                //   ms
+    xSettingsApplied : BOOL;                             // the current settings = the udiSet* / sSet* inputs
+    xNewFrame     : BOOL;                                // TRUE for one call: new frame in abFrame / sFrame
+    abFrame       : ARRAY[0..511] OF BYTE;
+    uiFrameLen    : UINT;
+    sFrame        : STRING(255);                         // the frame as text (bytes 0 end it)
+    udiFrames     : UDINT;                               // Serial/Com1/RxFrameCount
+    udiRxBytes    : UDINT;                               // Serial/Com1/RxCount
+    udiTxBytes    : UDINT;                               // Serial/Com1/TxCount
+    udiLineErrors : UDINT;                               // framing / parity / overrun errors
+    xSendBusy     : BOOL;
+    xSendDone     : BOOL;                                // TRUE until the next send: written to COM1
+    xOnline       : BOOL;                                // FALSE after 3 failed requests in a row
+    iLastStatus   : INT;
+    iLastWdaCode  : INT;
+    sLastError    : STRING(80);
+END_VAR
+VAR
+    fbHttp        : FB_HttpTransaction;
+    rtSend        : R_TRIG;
+    xSendPending  : BOOL;
+    abTx          : ARRAY[0..2559] OF BYTE;
+    abBody        : ARRAY[0..1791] OF BYTE;
+    udiTx         : UDINT;
+    udiBody       : UDINT;
+    iState        : INT;                                 // 0 wait, 1 send, 2 poll, 3 settings
+    xKnown        : BOOL;                                // settings read at least once
+    udiTriedBaud  : UDINT;                               // last settings written (or rejected):
+    sTriedFormat  : STRING(3);                           //   not written again until the inputs change
+    uiTriedGap    : UINT;
+    xBaudDiff     : BOOL;
+    xFormatDiff   : BOOL;
+    xGapDiff      : BOOL;
+    xNeedComma    : BOOL;
+    tLastPoll     : TIME;
+    xFirst        : BOOL := TRUE;
+    uiErrStreak   : UINT;
+    i             : UINT;
+    j             : UDINT;
+    b             : BYTE;
+    uiLen         : UINT;
+    pS            : POINTER TO BYTE;
+    p             : POINTER TO BYTE;
+    udiN          : UDINT;
+    diPos         : DINT;
+    liVal         : LINT;
+    iN            : INT;
+    pErr          : POINTER TO BYTE;
+    sHex          : STRING(16) := '0123456789abcdef';
+    pHex          : POINTER TO BYTE;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+xNewFrame := FALSE;
+rtSend(CLK := xSend);
+IF rtSend.Q THEN
+    xSendPending := TRUE;
+    xSendDone := FALSE;
+END_IF
+IF NOT xEnable THEN
+    fbHttp(xExecute := FALSE);
+    xOnline := FALSE;
+    xFirst := TRUE;
+    xKnown := FALSE;
+    udiTriedBaud := 0; sTriedFormat := ''; uiTriedGap := 0;
+    iState := 0;
+    RETURN;
+END_IF
+
+// settings: which of the requested ones differ from the current ones (and were not tried yet)
+xBaudDiff   := xKnown AND (udiSetBaudrate <> 0) AND (udiSetBaudrate <> udiBaudrate) AND (udiSetBaudrate <> udiTriedBaud);
+xFormatDiff := xKnown AND (LEN(sSetFormat) = 3) AND (sSetFormat <> sFormat) AND (sSetFormat <> sTriedFormat);
+xGapDiff    := xKnown AND (uiSetFrameGap <> 0) AND (uiSetFrameGap <> uiFrameGap) AND (uiSetFrameGap <> uiTriedGap);
+xSettingsApplied := xKnown AND ((udiSetBaudrate = 0) OR (udiSetBaudrate = udiBaudrate))
+                           AND ((LEN(sSetFormat) <> 3) OR (sSetFormat = sFormat))
+                           AND ((uiSetFrameGap = 0) OR (uiSetFrameGap = uiFrameGap));
+
+// ---------------------------------------------------------------- start a request
+IF iState = 0 THEN
+    IF (uiErrStreak > 0) AND (TIME() - tLastPoll < T#200MS) THEN
+        ;                                                 // after an error: at most 5 tries per second
+    ELSIF xBaudDiff OR xFormatDiff OR xGapDiff THEN
+        // {"data":[{"type":"parameters","id":"0-0-serial-com1-baudrate","attributes":{"value":19200}}, ...]}
+        udiBody := 0;
+        xNeedComma := FALSE;
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"data":[', udiBody);
+        IF xBaudDiff THEN
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"type":"parameters","id":"0-0-serial-com1-baudrate","attributes":{"value":', udiBody);
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), CONCAT(UDINT_TO_STRING(udiSetBaudrate), '}}'), udiBody);
+            xNeedComma := TRUE;
+        END_IF
+        IF xFormatDiff THEN
+            IF xNeedComma THEN F_AppendStr(ADR(abBody), SIZEOF(abBody), ',', udiBody); END_IF
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"type":"parameters","id":"0-0-serial-com1-format","attributes":{"value":"', udiBody);
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), CONCAT(sSetFormat, '"}}'), udiBody);
+            xNeedComma := TRUE;
+        END_IF
+        IF xGapDiff THEN
+            IF xNeedComma THEN F_AppendStr(ADR(abBody), SIZEOF(abBody), ',', udiBody); END_IF
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"type":"parameters","id":"0-0-serial-com1-framegap","attributes":{"value":', udiBody);
+            F_AppendStr(ADR(abBody), SIZEOF(abBody), CONCAT(UINT_TO_STRING(uiSetFrameGap), '}}'), udiBody);
+        END_IF
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), ']}', udiBody);
+        udiTx := 0;
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'PATCH /wda/parameters HTTP/1.0$R$N', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'Content-Type: application/vnd.api+json$R$N', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), CONCAT(CONCAT('Content-Length: ', UDINT_TO_STRING(udiBody)), '$R$N$R$N'), udiTx);
+        FOR j := 0 TO udiBody - 1 DO
+            abTx[udiTx] := abBody[j]; udiTx := udiTx + 1;
+        END_FOR
+        udiTriedBaud := udiSetBaudrate;                   // also when rejected: no endless retries
+        sTriedFormat := sSetFormat;
+        uiTriedGap := uiSetFrameGap;
+        iState := 3;
+    ELSIF xSendPending THEN
+        // body {"data":{"type":"parameters","id":"0-0-serial-com1-transmit","attributes":{"value":"..."}}}
+        udiBody := 0;
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), '{"data":{"type":"parameters","id":"0-0-serial-com1-transmit",', udiBody);
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), '"attributes":{"value":"', udiBody);
+        IF uiTxLen > 0 THEN
+            uiLen := MIN(uiTxLen, 256);
+            pS := ADR(abTxData);
+        ELSE
+            uiLen := TO_UINT(LEN(sTxData));
+            pS := ADR(sTxData);
+        END_IF
+        pHex := ADR(sHex);
+        FOR i := 0 TO uiLen - 1 DO                        // one character per byte: \u00XX outside printable ASCII
+            IF uiLen = 0 THEN EXIT; END_IF
+            b := pS[i];
+            IF (b >= 32) AND (b < 127) AND (b <> 34) AND (b <> 92) THEN
+                abBody[udiBody] := b; udiBody := udiBody + 1;
+            ELSE
+                F_AppendStr(ADR(abBody), SIZEOF(abBody), '\u00', udiBody);
+                abBody[udiBody] := pHex[b / 16]; abBody[udiBody + 1] := pHex[b MOD 16];
+                udiBody := udiBody + 2;
+            END_IF
+        END_FOR
+        F_AppendStr(ADR(abBody), SIZEOF(abBody), '"}}}', udiBody);
+        udiTx := 0;
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'PATCH /wda/parameters/0-0-serial-com1-transmit HTTP/1.0$R$N', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'Content-Type: application/vnd.api+json$R$N', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), CONCAT(CONCAT('Content-Length: ', UDINT_TO_STRING(udiBody)), '$R$N$R$N'), udiTx);
+        FOR j := 0 TO udiBody - 1 DO
+            abTx[udiTx] := abBody[j]; udiTx := udiTx + 1;
+        END_FOR
+        xSendPending := FALSE;
+        xSendBusy := TRUE;
+        iState := 1;
+    ELSIF TIME() - tLastPoll >= tPoll THEN
+        udiTx := 0;
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'GET /wda/parameters?filter[path]=Serial/Com1/Open,Serial/Com1/Baudrate,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'Serial/Com1/Format,Serial/Com1/FrameGap,Serial/Com1/TxCount,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'Serial/Com1/RxCount,Serial/Com1/RxFrame,Serial/Com1/RxFrameCount,', udiTx);
+        F_AppendStr(ADR(abTx), SIZEOF(abTx), 'Serial/Com1/Errors HTTP/1.0$R$N$R$N', udiTx);
+        iState := 2;
+    END_IF
+    IF iState > 0 THEN
+        tLastPoll := TIME();
+        fbHttp.pRequest := ADR(abTx);
+        fbHttp.udiRequestLen := udiTx;
+        fbHttp(xExecute := FALSE);                        // FALSE -> TRUE in the same cycle
+    END_IF
+END_IF
+
+// ---------------------------------------------------------------- run request
+IF iState > 0 THEN
+    fbHttp(xExecute := TRUE, sHost := sHost, uiPort := uiPort, tTimeout := tTimeout);
+    IF fbHttp.xDone OR fbHttp.xError THEN
+        iLastStatus := fbHttp.iStatus;
+        p := fbHttp.pBody;
+        udiN := fbHttp.udiBodyLen;
+        IF fbHttp.xDone AND ((((iState = 1) OR (iState = 3)) AND (iLastStatus = 204)) OR ((iState = 2) AND (iLastStatus = 200))) THEN
+            IF iState = 3 THEN
+                tLastPoll := TIME() - tPoll;              // settings written: read them back at once
+            ELSIF iState = 1 THEN
+                xSendBusy := FALSE;
+                xSendDone := TRUE;
+            ELSE
+                xOpen := F_WdaParseScalar(p, udiN, 'Serial/Com1/Open') = 1;
+                udiBaudrate := LINT_TO_UDINT(MAX(F_WdaParseScalar(p, udiN, 'Serial/Com1/Baudrate'), 0));
+                uiFrameGap := LINT_TO_UINT(MAX(F_WdaParseScalar(p, udiN, 'Serial/Com1/FrameGap'), 0));
+                udiTxBytes := LINT_TO_UDINT(MAX(F_WdaParseScalar(p, udiN, 'Serial/Com1/TxCount'), 0));
+                udiRxBytes := LINT_TO_UDINT(MAX(F_WdaParseScalar(p, udiN, 'Serial/Com1/RxCount'), 0));
+                udiLineErrors := LINT_TO_UDINT(MAX(F_WdaParseScalar(p, udiN, 'Serial/Com1/Errors'), 0));
+                iN := F_WdaDecodeBytes(p, udiN, 'Serial/Com1/Format', ADR(sFormat), 3);
+                IF iN >= 0 THEN pS := ADR(sFormat); pS[iN] := 0; END_IF
+                liVal := F_WdaParseScalar(p, udiN, 'Serial/Com1/RxFrameCount');
+                IF (liVal >= 0) AND (LINT_TO_UDINT(liVal) <> udiFrames) THEN
+                    iN := F_WdaDecodeBytes(p, udiN, 'Serial/Com1/RxFrame', ADR(abFrame), 512);
+                    uiFrameLen := TO_UINT(MAX(iN, 0));
+                    pS := ADR(sFrame);                    // as text: up to 255 bytes
+                    FOR i := 0 TO 254 DO
+                        IF i >= uiFrameLen THEN EXIT; END_IF
+                        pS[i] := abFrame[i];
+                    END_FOR
+                    pS[MIN(uiFrameLen, 255)] := 0;
+                    xNewFrame := NOT xFirst;              // not for the frame that was there before the start
+                    udiFrames := LINT_TO_UDINT(liVal);
+                END_IF
+                xFirst := FALSE;
+                xKnown := TRUE;
+            END_IF
+            uiErrStreak := 0;
+            xOnline := TRUE;
+            iLastWdaCode := 0;
+        ELSE
+            // 400/500 with WDA code (e.g. 21 = COM1 not open, 39 = character > U+00FF),
+            // 404 = gateway without COM1 (SERIAL_DEVICE empty or older than 2.5.0)
+            uiErrStreak := uiErrStreak + 1;
+            xOnline := uiErrStreak < 3;
+            IF iState = 1 THEN xSendBusy := FALSE; END_IF
+            iLastWdaCode := 0;
+            IF fbHttp.xDone THEN
+                sLastError := CONCAT('HTTP ', INT_TO_STRING(iLastStatus));
+                diPos := F_FindBytes(p, udiN, 0, '"code":"');
+                IF diPos >= 0 THEN
+                    j := TO_UDINT(diPos) + 8;
+                    WHILE (j < udiN) AND (p[j] >= 48) AND (p[j] <= 57) DO
+                        iLastWdaCode := iLastWdaCode * 10 + (p[j] - 48);
+                        j := j + 1;
+                    END_WHILE
+                END_IF
+                diPos := F_FindBytes(p, udiN, 0, '"detail":"');
+                IF diPos >= 0 THEN
+                    pErr := ADR(sLastError);
+                    j := 0;
+                    WHILE (TO_UDINT(diPos) + 10 + j < udiN) AND (j < 79) AND (p[TO_UDINT(diPos) + 10 + j] <> 34) DO
+                        pErr[j] := p[TO_UDINT(diPos) + 10 + j];
+                        j := j + 1;
+                    END_WHILE
+                    pErr[j] := 0;
+                END_IF
+            ELSE
+                sLastError := fbHttp.sErrorText;
+            END_IF
+        END_IF
+        fbHttp(xExecute := FALSE);
+        iState := 0;
+    END_IF
+END_IF
+=== END OF FB_WdaSerial ===
+
+=== OBJECT 13/14: PRG_WdaKbusIo_Example  (POU, Program, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// PRG_WdaKbusIo_Example  -  KBus I/O every 5 ms through FB_WdaKbusIo
+// Object type in CODESYS: POU, Program, language ST
+// Task: cyclic, 1 ms (e.g. task "KbusIoTask", priority 1), only this program
+//
+// Running light on all digital outputs, AO1 follows AI1. The channel counts
+// come from the gateway (fbIo.uiNumDO, ...): no configuration needed.
+//
+// WARNING: this switches REAL outputs. Check what is connected to the DO and
+// AO channels before you start the application.
+// ===========================================================================
+PROGRAM PRG_WdaKbusIo_Example
+VAR
+    fbIo        : FB_WdaKbusIo;
+    xRun        : BOOL := FALSE;        // set TRUE online to start the running light
+    tStep       : TIME := T#200MS;
+    fbStep      : TON;
+    uiStep      : UINT := 1;
+    i           : UINT;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+// 1. outputs: the application writes the desired values
+fbStep(IN := xRun AND NOT fbStep.Q, PT := tStep);
+IF fbStep.Q AND (fbIo.uiNumDO > 0) THEN
+    uiStep := (uiStep MOD fbIo.uiNumDO) + 1;
+END_IF
+FOR i := 1 TO fbIo.uiNumDO DO
+    fbIo.axDOSet[i] := xRun AND (i = uiStep);
+END_FOR
+IF (fbIo.uiNumAO > 0) AND (fbIo.uiNumAI > 0) THEN
+    fbIo.auiAOSet[1] := fbIo.auiAI[1];
+END_IF
+
+// 2. exchange with the gateway: every 5 ms, outputs only when they changed
+fbIo(xEnable := TRUE, tInterval := T#5MS);
+
+// 3. inputs and diagnostics
+//    fbIo.axDI[n], fbIo.auiAI[n]      inputs (raw), one KBus snapshot
+//    fbIo.axDO[n], fbIo.auiAO[n]      outputs as confirmed by the gateway
+//    fbIo.xReady, fbIo.xOnline, fbIo.xHealthy
+//    fbIo.tLastExchange, fbIo.tMaxExchange, fbIo.udiExchanges, fbIo.udiWrites
+//    fbIo.udiErrors, fbIo.iLastStatus, fbIo.iLastWdaCode, fbIo.sLastError
+=== END OF PRG_WdaKbusIo_Example ===
+
+=== OBJECT 14/14: PRG_WdaSerial_Example  (POU, Program, language ST) ===
+--- DECLARATION ---
+// ===========================================================================
+// PRG_WdaSerial_Example  -  COM1 through FB_WdaSerial
+// Object type in CODESYS: POU, Program, language ST
+// Task: cyclic, e.g. 10 ms
+//
+// Sends sRequest on a rising edge of xSendRequest (e.g. set online) and
+// every tCyclic when xCyclic is TRUE; every received frame is copied to
+// sLastFrame. The COM1 settings are set here (fbCom1.udiSetBaudrate /
+// sSetFormat / uiSetFrameGap, 0 / '' = keep) and shown in fbCom1.udiBaudrate / sFormat.
+// ===========================================================================
+PROGRAM PRG_WdaSerial_Example
+VAR
+    fbCom1        : FB_WdaSerial;
+    sRequest      : STRING(255) := 'STATUS?$R$N';   // what the device expects
+    xSendRequest  : BOOL;                           // set TRUE online: send once
+    xCyclic       : BOOL;                           // TRUE: send every tCyclic
+    tCyclic       : TIME := T#1S;
+    fbCyclic      : TON;
+    sLastFrame    : STRING(255);
+    udiFrames     : UDINT;
+END_VAR
+--- IMPLEMENTATION ---
+-----------------------------------------------------
+fbCyclic(IN := xCyclic AND NOT fbCyclic.Q, PT := tCyclic);
+
+fbCom1(xEnable := TRUE,
+       sTxData := sRequest,
+       xSend := xSendRequest OR fbCyclic.Q);
+IF fbCom1.xSendDone THEN
+    xSendRequest := FALSE;
+END_IF
+
+IF fbCom1.xNewFrame THEN
+    sLastFrame := fbCom1.sFrame;                    // binary: fbCom1.abFrame[0..uiFrameLen-1]
+    udiFrames := udiFrames + 1;
+END_IF
+
+// fbCom1.xOpen, fbCom1.udiBaudrate, fbCom1.sFormat, fbCom1.uiFrameGap   settings / state
+// fbCom1.xOnline, fbCom1.iLastStatus, fbCom1.iLastWdaCode, fbCom1.sLastError
+=== END OF PRG_WdaSerial_Example ===
+
+END OF BRIEF. Create the objects, build, and report as described in RULES 8.

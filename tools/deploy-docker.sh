@@ -130,7 +130,7 @@ docker rm -f kbus-gateway >/dev/null 2>&1 || true
 mkdir -p /run/kbus-gateway /home/kbus-gateway
 mkdir -p -m 700 /run/kbus-gateway-control      # control socket: only gateway + manager
 OPT=""
-for f in /etc/config-tools/get_typelabel_value:ro /dev/eeprom: /dev/ttyKbus: /dev/log: \
+for f in /etc/config-tools/get_typelabel_value:ro /dev/eeprom: /dev/ttyKbus: /dev/serial: /dev/log: \
          /etc/localtime:ro /etc/kbus-gateway-registers.conf:ro; do
     p=\${f%%:*}; ro=\${f#*:}; [ -n "\$ro" ] && ro=":\$ro"
     if [ -e "\$p" ]; then OPT="\$OPT -v \$p:\$p\$ro"; else echo "note: \$p not present, not mounted"; fi

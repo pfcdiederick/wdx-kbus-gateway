@@ -22,7 +22,7 @@ GW_CFLAGS  += -DGW_VERSION='"$(GW_VERSION)"'
 GW_LDLIBS  := -ldl
 
 SRCS := src/main.c src/log.c src/config.c src/gateway.c src/http_server.c src/wda.c \
-        src/registers.c src/backend_sim.c src/backend_adi.c
+        src/registers.c src/serial.c src/backend_sim.c src/backend_adi.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o) $(BUILD)/web_asset.o   # web page built into the binary
 
 ifneq ($(wildcard $(SDK)/include/dal/adi_application_interface.h),)

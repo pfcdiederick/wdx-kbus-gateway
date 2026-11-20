@@ -9,7 +9,10 @@ KBus I/O every 5 ms with only standard WDA REST-API requests (channel counts
 read from the gateway, one batch PATCH only when outputs change, one GET).
 Recommended for new projects.
 
-The ST code is in [st/](st/).
+The ST code is in [st/](st/). [PROMPT-for-Claude-in-CODESYS.txt](PROMPT-for-Claude-in-CODESYS.txt)
+is a ready-to-paste brief for Claude in CODESYS (MCP): it adds `FB_WdaKbusIo`,
+`FB_WdaSerial` and their helpers with all code, strictly additive, builds but
+does not download. Generated from the `.st` files: regenerate it after a change.
 
 ```
  PFC300 (PTXdist firmware)

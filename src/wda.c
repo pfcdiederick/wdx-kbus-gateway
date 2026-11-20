@@ -58,6 +58,15 @@
 //                                 all values of a class as one array (DO/AO writable)
 //   Registers/ChangeCounter       +1 for every write that changed a register
 //   Registers/<Name>/Value        declared in REGISTER_FILE (registers.c), writable
+//   Serial/Com1/...               COM1, transparent (serial.c), when SERIAL_DEVICE is set:
+//     Device, Open                the port and whether it is open
+//     Baudrate, Format, FrameGap  settings: written by the dashboard or a client (CODESYS:
+//                                 FB_WdaSerial), stored in KBUS_SETTINGS_STORE
+//     Transmit                    PATCH a string = send these bytes (one character per byte)
+//     TxCount, RxCount            bytes sent / received since the start
+//     RxData                      the last <= 512 received bytes (new = last RxCount-old bytes)
+//     RxFrame, RxFrameCount       the last frame (ended by a pause of FrameGap ms) and a counter
+//     Errors                      framing, parity and overrun errors since the port opened
 //
 // Thread safety: wda_handle() runs in several server threads at once; the
 // tables are only rebuilt by wda_init() while no request runs (http_server.c).
@@ -65,6 +74,7 @@
 #include "gateway.h"
 #include "log.h"
 #include "registers.h"
+#include "serial.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -73,6 +83,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #ifndef GW_VERSION
 #define GW_VERSION "unknown"
@@ -185,7 +196,9 @@ typedef enum {
     P_MOD_NAME, P_MOD_TYPE, P_MOD_CHCOUNT,
     P_CLS_INST, P_CH_VALUE, P_CH_MODULE, P_CH_MODCH, P_CLS_VALUES,
     P_REG_CHANGES, P_REG_VALUE,
-    P_CYCLEDUR, P_MAXCYCLEDUR, P_MAXLATE, P_OVERRUNS, P_RESETSTATS, P_LOCALCTRL
+    P_CYCLEDUR, P_MAXCYCLEDUR, P_MAXLATE, P_OVERRUNS, P_RESETSTATS, P_LOCALCTRL,
+    P_SER_DEVICE, P_SER_OPEN, P_SER_BAUD, P_SER_FORMAT, P_SER_GAP, P_SER_TX, P_SER_TXCOUNT,
+    P_SER_RXCOUNT, P_SER_RXDATA, P_SER_FRAME, P_SER_FRAMECOUNT, P_SER_ERRORS
 } pkind_t;
 
 typedef struct {
@@ -194,7 +207,7 @@ typedef struct {
     uint16_t idx;     // module or channel number (1-based), register index (0-based)
 } param_t;
 
-#define MAX_PARAMS (14 + KBUS_MAX_MODULES * 3 + IO_KIND_COUNT * (2 + GW_MAX_CHANNELS * 3) + 1 + REG_MAX)
+#define MAX_PARAMS (26 + KBUS_MAX_MODULES * 3 + IO_KIND_COUNT * (2 + GW_MAX_CHANNELS * 3) + 1 + REG_MAX)
 
 #define ID_MAX 64                    // longest: 0-0-registers-<40 characters>-value
 
@@ -205,6 +218,7 @@ static size_t   pcount;
 static uint16_t mod_channels[KBUS_MAX_MODULES];
 static uint32_t built_version;          // configuration the tables belong to (0 = none)
 static int      local_control;          // KBus/LocalControl (__atomic: several threads)
+static const char *g_serial_device = "";  // SERIAL_DEVICE (Serial/Com1/Device)
 
 static const char *const cls_name[IO_KIND_COUNT]   = { "DigitalInputs", "DigitalOutputs",
                                                        "AnalogInputs", "AnalogOutputs" };
@@ -262,6 +276,9 @@ static void build_list(void)
     add(P_REG_CHANGES, 0, 0);
     for (size_t r = 0; r < registers_count(); ++r)
         add(P_REG_VALUE, 0, r);
+    if (serial_enabled())
+        for (int k = P_SER_DEVICE; k <= P_SER_ERRORS; ++k)
+            add((pkind_t)k, 0, 0);
 }
 
 static void id_of(const param_t *p, char *buf, size_t len);
@@ -302,6 +319,18 @@ static void path_of(const param_t *p, char *buf, size_t len)
     case P_CLS_VALUES:  snprintf(buf, len, "KBus/%s", cls_values[p->cls]); break;
     case P_REG_CHANGES: snprintf(buf, len, "Registers/ChangeCounter"); break;
     case P_REG_VALUE:   snprintf(buf, len, "Registers/%s/Value", registers_def(p->idx)->name); break;
+    case P_SER_DEVICE:     snprintf(buf, len, "Serial/Com1/Device"); break;
+    case P_SER_OPEN:       snprintf(buf, len, "Serial/Com1/Open"); break;
+    case P_SER_BAUD:       snprintf(buf, len, "Serial/Com1/Baudrate"); break;
+    case P_SER_FORMAT:     snprintf(buf, len, "Serial/Com1/Format"); break;
+    case P_SER_GAP:        snprintf(buf, len, "Serial/Com1/FrameGap"); break;
+    case P_SER_TX:         snprintf(buf, len, "Serial/Com1/Transmit"); break;
+    case P_SER_TXCOUNT:    snprintf(buf, len, "Serial/Com1/TxCount"); break;
+    case P_SER_RXCOUNT:    snprintf(buf, len, "Serial/Com1/RxCount"); break;
+    case P_SER_RXDATA:     snprintf(buf, len, "Serial/Com1/RxData"); break;
+    case P_SER_FRAME:      snprintf(buf, len, "Serial/Com1/RxFrame"); break;
+    case P_SER_FRAMECOUNT: snprintf(buf, len, "Serial/Com1/RxFrameCount"); break;
+    case P_SER_ERRORS:     snprintf(buf, len, "Serial/Com1/Errors"); break;
     }
 }
 
@@ -343,6 +372,17 @@ static dtype_t dtype_of(const param_t *p)
     case P_MODULES:
     case P_CLS_INST:  return DT_INST;
     case P_MOD_NAME:  return DT_STRING;
+    case P_SER_OPEN:  return DT_BOOL;
+    case P_SER_BAUD:  return DT_UINT32;
+    case P_SER_DEVICE:
+    case P_SER_FORMAT:
+    case P_SER_TX:
+    case P_SER_RXDATA:
+    case P_SER_FRAME: return DT_STRING;
+    case P_SER_TXCOUNT:
+    case P_SER_RXCOUNT:
+    case P_SER_FRAMECOUNT:
+    case P_SER_ERRORS: return DT_UINT64;
     case P_CH_VALUE:
     case P_CLS_VALUES: return is_digital((io_kind_t)p->cls) ? DT_BOOL : DT_UINT16;
     default:          return DT_UINT16;
@@ -356,10 +396,15 @@ static int is_numeric(dtype_t t)
 }
 
 static int is_array(const param_t *p)  { return p->kind == P_CLS_VALUES; }
+static int is_serial(const param_t *p) { return p->kind >= P_SER_DEVICE && p->kind <= P_SER_ERRORS; }
+static int is_serial_setting(const param_t *p)
+{
+    return p->kind == P_SER_BAUD || p->kind == P_SER_FORMAT || p->kind == P_SER_GAP;
+}
 static int writeable(const param_t *p)
 {
     if (p->kind == P_RESCAN || p->kind == P_RESETSTATS || p->kind == P_CYCLETIME || p->kind == P_REG_VALUE ||
-        p->kind == P_LOCALCTRL)
+        p->kind == P_LOCALCTRL || is_serial_setting(p) || p->kind == P_SER_TX)
         return 1;
     return (p->kind == P_CH_VALUE || p->kind == P_CLS_VALUES) && io_kind_writable((io_kind_t)p->cls);
 }
@@ -368,7 +413,8 @@ static int writeable(const param_t *p)
 static int user_setting(const param_t *p, const gw_config_t *cfg)
 {
     return (p->kind == P_REG_VALUE && registers_def(p->idx)->persistent) ||
-           ((p->kind == P_CYCLETIME || p->kind == P_LOCALCTRL) && cfg->settings_store && *cfg->settings_store);
+           ((p->kind == P_CYCLETIME || p->kind == P_LOCALCTRL || is_serial_setting(p)) &&
+            cfg->settings_store && *cfg->settings_store);
 }
 
 static const char *dtype_name(dtype_t t)
@@ -405,6 +451,7 @@ typedef struct {
     gw_stats_t  stats;
     uint64_t    reg_changes;
     reg_value_t reg[REG_MAX];
+    serial_snapshot_t ser;
 } values_t;
 
 static values_t *values_take(void)
@@ -415,6 +462,7 @@ static values_t *values_take(void)
     gateway_snapshot(v->snap);
     gateway_stats(&v->stats);
     registers_snapshot(v->reg, &v->reg_changes);
+    serial_snapshot(&v->ser);
     return v;
 }
 
@@ -495,6 +543,26 @@ static void write_value(wbuf_t *b, const param_t *p, const values_t *v)
     case P_REG_VALUE: {
         char json[REG_JSON_MAX];
         registers_format(registers_def(p->idx)->type, &v->reg[p->idx], json, sizeof(json));
+        wb_printf(b, "%s", json);
+        break;
+    }
+    case P_SER_DEVICE:     wb_json_string(b, g_serial_device); break;
+    case P_SER_OPEN:       wb_printf(b, v->ser.open ? "true" : "false"); break;
+    case P_SER_BAUD:       wb_printf(b, "%u", (unsigned)v->ser.baud); break;
+    case P_SER_FORMAT:     wb_json_string(b, v->ser.format); break;
+    case P_SER_GAP:        wb_printf(b, "%u", (unsigned)v->ser.frame_gap_ms); break;
+    case P_SER_TX:         wb_printf(b, "\"\""); break;
+    case P_SER_TXCOUNT:    wb_printf(b, "%llu", (unsigned long long)v->ser.tx_count); break;
+    case P_SER_RXCOUNT:    wb_printf(b, "%llu", (unsigned long long)v->ser.rx_count); break;
+    case P_SER_FRAMECOUNT: wb_printf(b, "%llu", (unsigned long long)v->ser.frame_count); break;
+    case P_SER_ERRORS:     wb_printf(b, "%llu", (unsigned long long)v->ser.errors); break;
+    case P_SER_RXDATA:
+    case P_SER_FRAME: {
+        char json[SERIAL_JSON_MAX];
+        if (p->kind == P_SER_RXDATA)
+            serial_format_bytes(v->ser.rx, v->ser.rx_len, json, sizeof(json));
+        else
+            serial_format_bytes(v->ser.frame, v->ser.frame_len, json, sizeof(json));
         wb_printf(b, "%s", json);
         break;
     }
@@ -1035,6 +1103,12 @@ typedef struct {
     size_t      rn;
     struct { const param_t *p; const char *v; size_t vl; } log[LOG_ITEMS];   // KBUS writes, for the log
     size_t      nlog;
+    uint32_t    ser_baud;                                  // 0 = unchanged
+    char        ser_fmt[4];                                // "" = unchanged
+    uint32_t    ser_gap;                                   // 0 = unchanged
+    uint8_t     ser_tx[SERIAL_BUF];
+    size_t      ser_tx_len;
+    int         ser_tx_set;
     char        sv[REQ_MAX];                               // values converted from stringValue
     size_t      svn;
 } batch_t;
@@ -1053,6 +1127,10 @@ static batch_t *batch_new(void)
     bt->rn = 0;
     bt->nlog = 0;
     bt->svn = 0;
+    bt->ser_baud = bt->ser_gap = 0;
+    bt->ser_fmt[0] = '\0';
+    bt->ser_tx_len = 0;
+    bt->ser_tx_set = 0;
     return bt;
 }
 
@@ -1130,9 +1208,10 @@ static int stage(batch_t *bt, const gw_config_t *cfg, int control, const param_t
         return verr(e, 400, WC_NOT_WRITEABLE, p, "parameter is read-only");
     if ((p->kind == P_LOCALCTRL || p->kind == P_RESETSTATS) && !control)
         return verr(e, 403, WC_UNAUTHORIZED, p, "only through the dashboard, after its login");
-    if (p->kind != P_REG_VALUE && !control && __atomic_load_n(&local_control, __ATOMIC_RELAXED))
+    const int kbus = p->kind != P_REG_VALUE && !is_serial(p);
+    if (kbus && !control && __atomic_load_n(&local_control, __ATOMIC_RELAXED))
         return verr(e, 403, WC_UNAUTHORIZED, p, "local control: only the dashboard may write the KBUS");
-    if (p->kind != P_REG_VALUE && p->kind != P_LOCALCTRL && p->kind != P_RESETSTATS && !cfg->http_write_enable)
+    if (kbus && p->kind != P_LOCALCTRL && p->kind != P_RESETSTATS && !cfg->http_write_enable)
         return verr(e, 403, WC_UNAUTHORIZED, p, "KBUS writes are disabled (HTTP_WRITE_ENABLE=0)");
 
     const io_kind_t k = (io_kind_t)p->cls;
@@ -1214,6 +1293,52 @@ static int stage(batch_t *bt, const gw_config_t *cfg, int control, const param_t
             bt->kbn[k] = n;
         break;
     }
+    case P_SER_BAUD: {
+        long x = 0;
+        size_t i = 0;
+        while (i < vl && v[i] == ' ')
+            i++;
+        if (i == vl || v[i] < '0' || v[i] > '9')
+            return verr(e, 400, span_eq(v, vl, "null") ? WC_VALUE_NULL : WC_WRONG_TYPE, p, "value must be an integer");
+        for (; i < vl && v[i] >= '0' && v[i] <= '9' && x < 10000000; ++i)
+            x = x * 10 + (v[i] - '0');
+        if (i < vl || serial_valid_baud(x) != 0)
+            return verr(e, 400, WC_INVALID_VALUE, p, "baud rate 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200 or 230400");
+        bt->ser_baud = (uint32_t)x;
+        return 0;
+    }
+    case P_SER_GAP: {
+        int32_t x;
+        const int c = parse_scalar(v, vl, 0, &x);
+        if (c == WC_WRONG_TYPE || c == WC_VALUE_NULL)
+            return verr(e, 400, c, p, "value must be an integer 1..1000 (ms)");
+        if (c || x < 1 || x > 1000)
+            return verr(e, 400, WC_INVALID_VALUE, p, "frame gap must be 1..1000 ms");
+        bt->ser_gap = (uint32_t)x;
+        return 0;
+    }
+    case P_SER_FORMAT: {
+        if (vl < 2 || v[0] != '"' || v[vl - 1] != '"')
+            return verr(e, 400, WC_WRONG_TYPE, p, "value must be a string like \"8E1\"");
+        if (serial_valid_format(v + 1, vl - 2) != 0)
+            return verr(e, 400, WC_INVALID_VALUE, p, "format: data bits 5-8, parity N/E/O, stop bits 1/2, e.g. \"8E1\"");
+        memcpy(bt->ser_fmt, v + 1, 3);
+        bt->ser_fmt[3] = '\0';
+        return 0;
+    }
+    case P_SER_TX: {
+        const int r = serial_parse_bytes(v, vl, bt->ser_tx, sizeof(bt->ser_tx), &bt->ser_tx_len);
+        if (r)
+            return verr(e, 400, r == 400 ? WC_WRONG_TYPE : WC_INVALID_VALUE, p,
+                        r == 400 ? "value must be a JSON string (one character per byte)"
+                                 : "characters U+0000..U+00FF only, at most 512 bytes");
+        serial_snapshot_t s;
+        serial_snapshot(&s);
+        if (!s.open)
+            return verr(e, 500, WC_COULD_NOT_SET, p, "COM1 is not open (device missing or used by another program)");
+        bt->ser_tx_set = 1;
+        return 0;
+    }
     case P_REG_VALUE: {
         const reg_def_t *d = registers_def(p->idx);
         reg_value_t rv;
@@ -1252,7 +1377,7 @@ static int stage(batch_t *bt, const gw_config_t *cfg, int control, const param_t
     return 0;
 }
 
-static int commit(batch_t *bt, const gw_config_t *cfg, wbuf_t *b)
+static int commit(batch_t *bt, const gw_config_t *cfg, int control, wbuf_t *b)
 {
     int kchanged = 0;
     int kbus = 0;
@@ -1267,6 +1392,16 @@ static int commit(batch_t *bt, const gw_config_t *cfg, wbuf_t *b)
     }
     if (bt->rn)
         registers_write(bt->ridx, bt->rval, bt->rn, NULL);
+    if (bt->ser_baud || bt->ser_fmt[0] || bt->ser_gap) {     // COM1 settings first, then send
+        serial_configure(bt->ser_baud, bt->ser_fmt[0] ? bt->ser_fmt : NULL, bt->ser_gap);
+        serial_snapshot_t s;
+        serial_snapshot(&s);
+        LOG_INFO("COM1 settings changed%s: %u %s, frame gap %u ms", control ? " via the dashboard" : "",
+                 (unsigned)s.baud, s.format, (unsigned)s.frame_gap_ms);
+        config_store_serial(cfg, (int)s.baud, s.format, (int)s.frame_gap_ms);
+    }
+    if (bt->ser_tx_set && bt->ser_tx_len && serial_write(bt->ser_tx, bt->ser_tx_len) != 0)
+        return error(b, 500, WC_COULD_NOT_SET, NULL, "COM1: the bytes could not be sent");
     if (bt->local_ctrl >= 0 && bt->local_ctrl != __atomic_load_n(&local_control, __ATOMIC_RELAXED)) {
         __atomic_store_n(&local_control, bt->local_ctrl, __ATOMIC_RELAXED);
         LOG_INFO("local control %s via the dashboard: %s", bt->local_ctrl ? "ON" : "OFF",
@@ -1347,7 +1482,7 @@ static int do_patch(const char *req, size_t len, const gw_config_t *cfg, int con
     if (st < 0)
         st = error(b, 400, WC_NONE, "/data/attributes", "data.attributes.value missing");
     else if (st == 0 && (st = stage(bt, cfg, control, p, v, vl, &e)) == 0)
-        st = commit(bt, cfg, b);
+        st = commit(bt, cfg, control, b);
     if (st > 0 && b->len == 0) {
         char ptr[48];
         snprintf(ptr, sizeof(ptr), "/data/attributes/%s", member);
@@ -1478,7 +1613,7 @@ static int do_patch_batch(const char *req, size_t len, const gw_config_t *cfg, i
         st = status;
     }
     if (st == 0)
-        st = commit(bt, cfg, b);
+        st = commit(bt, cfg, control, b);
     wbuf_free(&eb);
     free(items);
     free(bt);
@@ -1495,6 +1630,7 @@ static int do_patch_batch(const char *req, size_t len, const gw_config_t *cfg, i
 void wda_config(const gw_config_t *cfg)
 {
     __atomic_store_n(&local_control, cfg->local_control ? 1 : 0, __ATOMIC_RELAXED);
+    g_serial_device = cfg->serial_device;
 }
 
 void wda_init(void)
@@ -1612,4 +1748,113 @@ int wda_handle(const char *req, size_t len, const gw_config_t *cfg, int control,
     if (p == NULL)
         return not_found(b, id, idlen);
     return patch ? do_patch(req, len, cfg, control, p, id, idlen, b) : do_get_one(p, b);
+}
+
+// ---------------------------------------------------------------------------
+// GET /events?ids=a,b,c: live values as Server-Sent Events (see wda.h)
+// ---------------------------------------------------------------------------
+#define EVENT_IDS_MAX 300
+
+int wda_events(const char *q, size_t qlen, const gw_config_t *cfg, const wda_stream_t *io, wbuf_t *b)
+{
+    // ids=<id>,<id>,... (lower-case ids only: they go into the JSON keys unchanged)
+    char *dec = malloc(REQ_MAX);
+    const char **ids = malloc(EVENT_IDS_MAX * sizeof(*ids));
+    if (dec == NULL || ids == NULL) {
+        free(dec);
+        free(ids);
+        return error(b, 500, WC_INTERNAL, NULL, "out of memory");
+    }
+    size_t n = 0, dl = 0;
+    for (size_t p = 0; p < qlen;) {
+        size_t e = p;
+        while (e < qlen && q[e] != '&')
+            e++;
+        if (e - p > 4 && memcmp(q + p, "ids=", 4) == 0)
+            dl = pct_decode(q + p + 4, e - p - 4, dec, REQ_MAX);
+        p = e + 1;
+    }
+    int bad = dl == 0;
+    for (size_t i = 0, st = 0; i <= dl && !bad; ++i) {
+        if (i == dl || dec[i] == ',') {
+            if (i == st || n >= EVENT_IDS_MAX)
+                bad = 1;
+            else
+                ids[n++] = dec + st;
+            if (i < dl)
+                dec[i] = '\0';
+            st = i + 1;
+        } else if (!islower((unsigned char)dec[i]) && !isdigit((unsigned char)dec[i]) && dec[i] != '-') {
+            bad = 1;
+        }
+    }
+    if (bad) {
+        free(dec);
+        free(ids);
+        return error(b, 400, WC_NONE, NULL, "use GET /events?ids=<id>,<id>,... (up to 300 parameter ids)");
+    }
+
+    char  **last = calloc(n, sizeof(*last));                // last value sent, as JSON
+    size_t *lastlen = calloc(n, sizeof(*lastlen));
+    wbuf_t msg = { NULL, 0, 0, "" }, val = { NULL, 0, 0, "" };
+    static const char head[] = "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                               "X-Accel-Buffering: no\r\nConnection: close\r\n\r\nretry: 1000\n\n";
+    int rc = (last == NULL || lastlen == NULL) ? -1 : io->send(io->ctx, head, sizeof(head) - 1);
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    int64_t last_ping = 0;
+    while (rc == 0 && !*io->stop) {
+        msg.len = 0;
+        wb_printf(&msg, "data: {");
+        int changed = 0;
+        io->lock();
+        values_t *v = values_take();
+        for (size_t i = 0; v != NULL && i < n; ++i) {
+            const param_t *p = find_id(ids[i], strlen(ids[i]));
+            if (p == NULL)
+                continue;                                   // e.g. channel gone after a rescan
+            val.len = 0;
+            write_value(&val, p, v);
+            if (val.data == NULL || (lastlen[i] == val.len && last[i] && memcmp(last[i], val.data, val.len) == 0))
+                continue;
+            char *copy = realloc(last[i], val.len);
+            if (copy == NULL)
+                continue;
+            memcpy(copy, val.data, val.len);
+            last[i] = copy;
+            lastlen[i] = val.len;
+            wb_printf(&msg, changed++ ? ",\"%s\":%.*s" : "\"%s\":%.*s", ids[i], (int)val.len, val.data);
+        }
+        io->unlock();
+        free(v);
+        if (changed) {
+            wb_printf(&msg, "}\n\n");
+            rc = io->send(io->ctx, msg.data, msg.len);
+        }
+        const int64_t now = (int64_t)next.tv_sec * 1000 + next.tv_nsec / 1000000;
+        if (rc == 0 && now - last_ping >= 1000) {
+            static const char ping[] = "event: ping\ndata: \n\n";
+            rc = io->send(io->ctx, ping, sizeof(ping) - 1);
+            last_ping = now;
+        }
+        next.tv_nsec += (long)cfg->event_ms * 1000000L;
+        while (next.tv_nsec >= 1000000000L) {
+            next.tv_nsec -= 1000000000L;
+            next.tv_sec++;
+        }
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if (t.tv_sec > next.tv_sec + 1)                     // far behind (e.g. a long rescan): catch up
+            next = t;
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    }
+    for (size_t i = 0; last && i < n; ++i)
+        free(last[i]);
+    free(last);
+    free(lastlen);
+    wbuf_free(&msg);
+    wbuf_free(&val);
+    free(dec);
+    free(ids);
+    return 0;
 }

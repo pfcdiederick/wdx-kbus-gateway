@@ -759,6 +759,14 @@ the gateway container is started with `--pid host`; `-e KBUS_DASHBOARD_CHECK=0`
 (`GW_ENV`) switches it off. `MG_LIGHTTPD=0` removes the wanted config and the
 installed one.
 
+**Live values.** The page receives the values as a stream (Server-Sent Events,
+`/kbus/api/events`): the manager asks the gateway every 50 ms on the controller
+(`MGMT_EVENT_MS`) and pushes only the changes over one open connection, so a
+change shows up within about 50–100 ms. Without the stream (e.g. a proxy that
+buffers), the page falls back to polling every 300 ms (I/O) or 900 ms. The
+lighttpd config passes the stream on unbuffered (`server.stream-response-body = 2`
+for `/kbus/api/events` in `kbus.conf`).
+
 The page has the layout of the controller's Web-based Management (WBM): tab
 menu at the top, page menu on the left, collapsible panels, status bar with
 date, time and LEDs (KBUS, gateway, writes, login). Fonts, logo and favicon
@@ -768,10 +776,10 @@ Docker host); without them the page uses system fonts.
 | Tab | Pages |
 |---|---|
 | Status | *KBUS Status*: state, cycle time, cycles, errors, timing (`MaxCycleDuration`, `Overruns` ...), *Control* (remote / local), *Reset Statistics* 🔒 (cycles, errors, maximum values, overruns), *Rescan KBUS*; *Modules* |
-| I/O | *Process Image*: *Control* panel with *Take / Release Local Control* 🔒; digital inputs and outputs as LEDs, output buttons ON/OFF, analog values with bars, analog outputs to set |
+| I/O | *Process Image*: *Control* panel with *Take / Release Local Control* 🔒; digital inputs and outputs as ON/OFF boxes (green = ON; a click switches an output), analog values with bars, analog outputs to set |
 | Parameters | all parameters with path, id, type, value, writeable, userSetting; filter; the id links to `/definition` |
 | Registers | all registers with type and value, input field and *Set* |
-| Settings | *KBUS Cycle*: cycle time 1–40 ms; *Login*: login on/off, user and password |
+| Settings | *KBUS*: cycle time 1–40 ms; *Login*: login on/off, user and password |
 
 **Login.** Reset Statistics, Local Control and changing the login settings
 always need the login. The **gear button** at the top right, next to *WBM*,
@@ -822,6 +830,20 @@ switch outputs and change registers; Reset Statistics, Local Control and the
 login settings still need the login. The login is HTTP Basic: over `https://<pfc-ip>/kbus/` (HTTPS-only
 mode, the default) it is encrypted; in *HTTP and HTTPS* mode it is not when
 plain `http://` is used.
+
+### 3.7a Serial interface COM1
+
+The gateway also forwards **COM1** (`/dev/serial`, RS-232 or RS-485 as set in
+the WBM, owner *None*) transparently over the data layer: `Serial/Com1/...`
+(`Transmit`, `RxFrame`, `RxFrameCount`, `RxData`, `RxCount`, `TxCount`,
+`Errors`, `Open`). The settings (baud rate, format such as `8E1`, frame gap)
+are made on the client side: CODESYS sets them with `FB_WdaSerial` (inputs
+`udiSetBaudrate`, `sSetFormat`, `uiSetFrameGap`); they are kept after a restart,
+and the dashboard (*Settings > COM1*) shows them. CODESYS sends and
+receives with `FB_WdaSerial`: [codesys/FB_WdaSerial.md](codesys/FB_WdaSerial.md).
+`SERIAL_DEVICE` (default `/dev/serial`, empty = off), `SERIAL_BAUD`,
+`SERIAL_FORMAT`, `SERIAL_FRAME_GAP_MS` are the defaults until a client
+stores other values. KBUS and COM1 run in one gateway (container).
 
 ### 3.8 IEC 60870-5-104 server (kbus-iec104)
 
@@ -1030,6 +1052,7 @@ the parameter tree: requests read it, a rescan rebuilds it.
 | `src/http_server.c/.h` | Unix socket + TCP listener, one thread per client, time-outs, rescans between requests, request log |
 | `src/wda.c/.h` | wdx data layer: parameter table (built once per configuration), JSON:API output, minimal JSON reader, single and batch PATCH |
 | `src/registers.c/.h` | register provider: declarations file, values, JSON parsing, persistence |
+| `src/serial.c/.h` | COM1: transparent forwarding, receive thread, frames by pause (`FrameGap`), settings |
 | `src/log.c/.h` | stderr or syslog |
 | `web/index.html` + `src/web_asset.S` | the web page (3.5), embedded into the binary |
 

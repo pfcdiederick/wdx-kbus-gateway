@@ -28,4 +28,19 @@ int  wda_handle(const char *req, size_t len, const gw_config_t *cfg, int control
 
 void wbuf_free(wbuf_t *b);
 
+// GET /events?ids=a,b,c (extension, not WDA): live values as Server-Sent Events.
+// Every cfg->event_ms the values of these parameters are compared with the last
+// ones sent; changes go out as  data: {"id":value,...}  (the first message has
+// all of them), "event: ping" every second. Returns when send() fails (client
+// gone) or *stop is set. lock()/unlock() guard the parameter tables per check.
+typedef struct {
+    int  (*send)(void *ctx, const char *data, size_t len);   // 0 = ok
+    void (*lock)(void);
+    void (*unlock)(void);
+    void *ctx;
+    const volatile int *stop;
+} wda_stream_t;
+// Returns 0 when the stream ran, else an HTTP status for an error answer in body.
+int  wda_events(const char *query, size_t qlen, const gw_config_t *cfg, const wda_stream_t *io, wbuf_t *body);
+
 #endif

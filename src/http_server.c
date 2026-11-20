@@ -24,6 +24,8 @@
 // (tree lock); requests wait for them.
 //
 // GET / (and /index.html) returns the built-in web page (web/index.html).
+// GET /events?ids=a,b (extension): live values as a stream (wda_events, wda.c);
+// at most WDX_MAX_STREAMS at a time, each holds one client slot while it runs.
 // HTTP_PRIORITY: optional SCHED_FIFO priority, inherited by the client threads.
 // HTTP_LOG: 0 = nothing, 1 = writes that change an output (wda.c), 2 = every request.
 #define _GNU_SOURCE  // accept4, SOCK_NONBLOCK, struct ucred, pthread_rwlockattr_setkind_np
@@ -208,6 +210,45 @@ static void send_error(int cfd, int status, const char *detail, int64_t deadline
 // ---------------------------------------------------------------------------
 // One client
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Live values: GET /events
+// ---------------------------------------------------------------------------
+static int streams;                              // GET /events running (__atomic)
+
+static int stream_send(void *ctx, const char *data, size_t len)
+{
+    return send_all(*(int *)ctx, data, len, now_ms() + 2000);
+}
+static void stream_lock(void)   { pthread_rwlock_rdlock(&tree_lock); }
+static void stream_unlock(void) { pthread_rwlock_unlock(&tree_lock); }
+
+static void serve_events(int cfd, const char *peer, const char *rx, size_t n)
+{
+    const gw_config_t *cfg = g_cfg;
+    if (__atomic_add_fetch(&streams, 1, __ATOMIC_RELAXED) > cfg->max_streams) {
+        __atomic_sub_fetch(&streams, 1, __ATOMIC_RELAXED);
+        send_error(cfd, 503, "too many live streams (WDX_MAX_STREAMS)", now_ms() + 500);
+        return;
+    }
+    size_t e = 11;                               // after "GET /events"
+    while (e < n && rx[e] != ' ' && rx[e] != '\r' && rx[e] != '\n')
+        e++;
+    const char *q = rx[11] == '?' ? rx + 12 : rx + 11;
+    const size_t qlen = rx[11] == '?' ? e - 12 : 0;
+    if (cfg->http_log >= 1)
+        LOG_INFO("%s: live stream started", peer);
+    wbuf_t body = { NULL, 0, 0, "" };
+    int fd = cfd;
+    const wda_stream_t io = { stream_send, stream_lock, stream_unlock, &fd, (const volatile int *)g_stop };
+    const int st = wda_events(q, qlen, cfg, &io, &body);
+    if (st)
+        send_response(cfd, st, "application/vnd.api+json", body.data, body.len, now_ms() + 500);
+    else if (cfg->http_log >= 1)
+        LOG_INFO("%s: live stream ended", peer);
+    wbuf_free(&body);
+    __atomic_sub_fetch(&streams, 1, __ATOMIC_RELAXED);
+}
+
 static void serve_client(int cfd, const char *peer, int control)
 {
     const gw_config_t *cfg = g_cfg;
@@ -241,6 +282,12 @@ static void serve_client(int cfd, const char *peer, int control)
         }
         if ((want > 0 && n >= want) || n >= RX_MAX)
             break;
+    }
+
+    if (n > 11 && memcmp(rx, "GET /events", 11) == 0 && (rx[11] == '?' || rx[11] == ' ')) {
+        serve_events(cfd, peer, rx, n);
+        free(rx);
+        return;
     }
 
     if (is_page_request(rx, n)) {

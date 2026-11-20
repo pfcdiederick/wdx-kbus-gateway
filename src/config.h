@@ -21,6 +21,8 @@ typedef struct {
     int         http_priority;      // HTTP_PRIORITY      (default 0): SCHED_FIFO priority of the server, 0 = normal
     int         max_clients;        // WDX_MAX_CLIENTS    (default 16): connections served at the same time
     int         client_timeout_ms;  // WDX_CLIENT_TIMEOUT_MS (default 5000): time for a client to send its request
+    int         event_ms;           // WDX_EVENT_MS       (default 10): GET /events checks the values this often
+    int         max_streams;        // WDX_MAX_STREAMS    (default 4): GET /events connections at the same time
     // Registers
     const char *register_file;      // REGISTER_FILE      (default /etc/kbus-gateway-registers.conf)
     const char *register_store;     // REGISTER_STORE     (default /home/kbus-gateway/registers.dat, "" = off)
@@ -31,6 +33,12 @@ typedef struct {
                                  //   and wins over KBUS_CYCLE_MS
     const char *settings_store;  // KBUS_SETTINGS_STORE (default /home/kbus-gateway/kbus-settings.conf, "" = off)
     int         local_control;   // stored KBus/LocalControl (settings_store), default 0
+    // Serial interface COM1 (serial.c): transparent forwarding
+    const char *serial_device;   // SERIAL_DEVICE    (default /dev/serial; "" = off; off in simulation)
+    int         serial_baud;     // SERIAL_BAUD      (default 19200)
+    char        serial_format[4];// SERIAL_FORMAT    (default 8E1: data bits, parity N/E/O, stop bits)
+    int         serial_frame_gap_ms; // SERIAL_FRAME_GAP_MS (default 10): a pause this long ends a frame
+                                 //   values written via Serial/Com1/... are stored in settings_store and win
     int         rt_priority;     // KBUS_PRIORITY    (default 40, SCHED_FIFO; 0 = no real-time)
     int         simulation;      // KBUS_SIMULATION  (default 0): simulated I/O, no hardware
     const char *dal_libs;        // KBUS_DAL_LIB     colon separated dlopen() candidates
@@ -47,5 +55,6 @@ void config_log(const gw_config_t *cfg);
 int  config_load_stored(gw_config_t *cfg);
 int  config_store_cycle(const gw_config_t *cfg, int cycle_ms);
 int  config_store_local_control(const gw_config_t *cfg, int on);
+int  config_store_serial(const gw_config_t *cfg, int baud, const char *format, int frame_gap_ms);
 
 #endif

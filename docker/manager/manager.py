@@ -12,6 +12,9 @@ the Unix socket:
   /api/definitions       all parameters with their definitions (one request)
   /api/settings          login settings (GET; POST JSON {login, user, password})
   /api/info              date and time of the controller (status bar)
+  /api/events?ids=a,b    live values as Server-Sent Events: the gateway's own stream
+                         (GET /events, changes every WDX_EVENT_MS = 10 ms) passed through; with
+                         an older gateway the manager polls every MGMT_EVENT_MS (50 ms) instead
   /wbm-assets/...        fonts, logo and favicon of the controller's own WBM (look of the page)
 
 Login: the website itself is open by default ("Login required" on the Settings
@@ -36,6 +39,8 @@ Environment
                   the page also stays reachable without the prefix. "" = off
   MGMT_WBM_URL    WBM to take fonts and logo from, default https://<docker host>/wbm
   MGMT_READONLY   1 = no writes (PATCH answers 403), default 0
+  MGMT_EVENT_MS   interval of the live values (/api/events), default 50 ms
+  MGMT_EVENT_CLIENTS  live connections at the same time, default 8
   MGMT_DEFAULT_USER / MGMT_DEFAULT_PASSWORD   login until one is set, default admin / wago
   WDX_SOCKET      default /run/kbus-gateway/wdx.sock
   CONTROL_SOCKET  default /run/kbus-gateway-control/control.sock (used when present)
@@ -50,6 +55,7 @@ import re
 import socket
 import ssl
 import struct
+import urllib.parse
 import urllib.request
 import sys
 import threading
@@ -62,6 +68,11 @@ DEFAULT_USER = os.environ.get("MGMT_DEFAULT_USER", "admin")
 DEFAULT_PASSWORD = os.environ.get("MGMT_DEFAULT_PASSWORD", "wago")
 # parameters that only work after the login (and only through the control socket)
 PROTECTED_IDS = (b"0-0-kbus-resetstatistics", b"0-0-kbus-localcontrol")
+EVENT_S = max(10, int(os.environ.get("MGMT_EVENT_MS", "50"))) / 1000.0
+EVENT_CLIENTS = int(os.environ.get("MGMT_EVENT_CLIENTS", "8"))
+IDS_RE = re.compile(r"^[a-z0-9-]{1,80}(,[a-z0-9-]{1,80}){0,299}$")
+_events_lock = threading.Lock()
+_events_active = 0
 PORT = int(os.environ.get("MGMT_PORT", "8080"))
 PREFIX = os.environ.get("MGMT_PREFIX", "/kbus").rstrip("/")
 READONLY = os.environ.get("MGMT_READONLY", "0") == "1"
@@ -351,6 +362,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.login_required("login")
             return self.send(200, "application/json",
                              json.dumps({"user": SETTINGS.user, "defaultPassword": SETTINGS.default_pw}).encode())
+        if p == "/api/events":
+            return self.events()
         if p == "/api/info":
             return self.send(200, "application/json",
                              json.dumps({"date": time.strftime("%d.%m.%Y"), "time": time.strftime("%H:%M:%S")}).encode())
@@ -367,6 +380,101 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, "text/plain", b"not found\n")
 
     do_HEAD = do_GET
+
+    def events(self):
+        """Live values (Server-Sent Events): only changes, over one connection."""
+        global _events_active
+        q = urllib.parse.parse_qs(self.path.partition("?")[2])
+        ids = (q.get("ids") or [""])[0]
+        if not IDS_RE.match(ids):
+            return self.send(400, "text/plain", b"ids=<id>,<id>,... (lower-case parameter ids)\n")
+        with _events_lock:
+            if _events_active >= EVENT_CLIENTS:
+                return self.send(503, "text/plain", b"too many live connections\n")
+            _events_active += 1
+        try:
+            if self.relay_gateway_stream(ids):
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(b"retry: 1000\n\n")
+            path = f"/wda/parameters?filter[id]={ids}&page[limit]=1000"
+            last, gw_ok, last_ping = {}, None, 0.0
+            while True:
+                t0 = time.monotonic()
+                try:
+                    st, _, data = gateway("GET", path)
+                    vals = {x["id"]: x["attributes"]["value"] for x in json.loads(data)["data"]} if st == 200 else None
+                except (OSError, ValueError, KeyError):
+                    vals = None
+                out = b""
+                if vals is None:
+                    if gw_ok is not False:
+                        out += b"event: gwerror\ndata: {}\n\n"
+                    gw_ok, last = False, {}
+                else:
+                    gw_ok = True
+                    changed = {k: v for k, v in vals.items() if k not in last or last[k] != v}
+                    if changed:
+                        last.update(changed)
+                        out += b"data: " + json.dumps(changed, separators=(",", ":")).encode() + b"\n\n"
+                if t0 - last_ping >= 1.0:
+                    out += b"event: ping\ndata: \n\n"
+                    last_ping = t0
+                if out:
+                    self.wfile.write(out)
+                    self.wfile.flush()
+                time.sleep(max(0.0, EVENT_S - (time.monotonic() - t0)))
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                                          # the browser closed the page or changed it
+        finally:
+            with _events_lock:
+                _events_active -= 1
+
+    def relay_gateway_stream(self, ids):
+        """Pass the gateway's own stream (GET /events, changes every 10 ms) through
+        unchanged. False when the gateway has none (older than 2.5.0): poll instead."""
+        try:
+            g = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            g.settimeout(3)
+            g.connect(gateway_socket())
+            g.sendall(f"GET /events?ids={ids} HTTP/1.0\r\n\r\n".encode())
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 4096:
+                d = g.recv(4096)
+                if not d:
+                    break
+                head += d
+        except OSError:
+            return False
+        hdr, _, rest = head.partition(b"\r\n\r\n")
+        if not hdr.startswith(b"HTTP/1.0 200"):
+            g.close()
+            return False
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        g.settimeout(5)                                   # the gateway pings every second
+        try:
+            if rest:
+                self.wfile.write(rest)
+                self.wfile.flush()
+            while True:
+                d = g.recv(65536)
+                if not d:
+                    break
+                self.wfile.write(d)
+                self.wfile.flush()
+        finally:
+            g.close()
+        return True
 
     def do_PATCH(self):
         if not self.authorized():
