@@ -29,7 +29,7 @@ case "$ARCH" in
     *) echo "unknown arch '$ARCH' (arm64 | armhf)" >&2; exit 1 ;;
 esac
 [ -f "$ROOT/sdk/include/dal/adi_application_interface.h" ] || {
-    echo "sdk/include/dal is missing: import the WAGO SDK headers first (sdk/README.md)" >&2; exit 1; }
+    echo "sdk/include/dal is missing: import the WAGO SDK headers first (docs/MANUAL.md, 2.2)" >&2; exit 1; }
 
 OUT=$ROOT/build-ipk
 WORK=$OUT/$ARCH

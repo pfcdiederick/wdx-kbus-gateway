@@ -23,6 +23,8 @@ typedef struct {
     int         client_timeout_ms;  // WDX_CLIENT_TIMEOUT_MS (default 5000): time for a client to send its request
     int         event_ms;           // WDX_EVENT_MS       (default 10): GET /events checks the values this often
     int         max_streams;        // WDX_MAX_STREAMS    (default 4): GET /events connections at the same time
+    int         ai_status_ms;       // WDX_AI_STATUS_MS   (default and minimum 1000, 0 = off): status register 6
+                                    //   of every analog input channel is read this often (regcom.c)
     // Registers
     const char *register_file;      // REGISTER_FILE      (default /etc/kbus-gateway-registers.conf)
     const char *register_store;     // REGISTER_STORE     (default /home/kbus-gateway/registers.dat, "" = off)

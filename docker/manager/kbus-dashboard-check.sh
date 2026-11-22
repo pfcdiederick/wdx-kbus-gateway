@@ -3,7 +3,7 @@
 #
 # Runs ON THE CONTROLLER (busybox sh):
 #   - at every start of the gateway container, before the gateway starts
-#     (docker/gateway/entrypoint.sh, through nsenter into the controller's namespaces)
+#     (docker/kbus-gateway/entrypoint.sh, through nsenter into the controller's namespaces)
 #   - by tools/deploy-docker.sh --manager, right after it stored the wanted config
 #
 # Wanted config:    /home/kbus-manager/lighttpd-kbus.conf  (/home survives a firmware update)

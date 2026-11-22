@@ -8,8 +8,9 @@
 #     --client       also the example client (docker/example-client)
 #     --manager      also the management web interface (docker/manager): the dashboard at
 #                    http(s)://<pfc-ip>/kbus through the controller's own web server
-#     --iec104       also the IEC 60870-5-104 server (docker/iec104), port 2404
-#   Images: docker/<gateway|example-client|manager|iec104>/Dockerfile (docker/README.md);
+#     --104-gateway  also the IEC 60870-5-104 server 104-gateway (docker/104-gateway), port 2404
+#                    (--iec104 = the same, old name)
+#   Images: docker/<kbus-gateway|example-client|manager|104-gateway>/Dockerfile (docs/MANUAL.md, 6.1);
 #   archives for the controller: build-docker/
 #     --no-gateway   leave the gateway as it is (native or container); e.g. only --manager
 #     --native       remove the gateway container, native service again
@@ -33,26 +34,26 @@
 #   GW_ENV      extra docker run arguments for the gateway, e.g. "-e KBUS_CYCLE_MS=2"
 #   MG_ENV      extra docker run arguments for the manager, e.g. "-e MGMT_READONLY=1"
 #   CL_ENV      extra docker run arguments for the example client, e.g. "-e PYTHON_RESPONSE="
-#               (no automatic answers to CODESYS: answer by hand with tools/wdx-chat.py)
+#               (no automatic answers to Codesys/Message)
 #   MG_PORT     port of the manager container on the controller (default 8090)
 #   MG_BIND     address the manager port is published on (default 127.0.0.1: only via /kbus;
 #               0.0.0.0 = also directly at http://<pfc-ip>:MG_PORT/)
 #   MG_LIGHTTPD 0 = do not install /etc/lighttpd/apps.confd/kbus.conf (no /kbus on port 80/443)
 #   IEC_PORT    port of the IEC 104 server on the controller (default 2404)
 #
-# IEC 104 parameter file: /home/kbus-iec104/wdx_iec104_config.ini on the controller
+# IEC 104 parameter file: /home/104-gateway/wdx_iec104_config.ini on the controller
 # (created from the image's default at the first deployment, then kept; edit it
-# and run "docker restart kbus-iec104").
+# and run "docker restart 104-gateway").
 set -euo pipefail
 
-PFC=${1:?usage: $0 <pfc-ip> [--client] [--manager] [--iec104] [--no-gateway] | --native}
+PFC=${1:?usage: $0 <pfc-ip> [--client] [--manager] [--104-gateway] [--no-gateway] | --native}
 shift
 GW=1; CL=0; MG=0; IEC=0; NATIVE=0
 for a in "$@"; do
     case "$a" in
         --client)     CL=1 ;;
         --manager)    MG=1 ;;
-        --iec104)     IEC=1 ;;
+        --104-gateway|--iec104) IEC=1 ;;
         --no-gateway) GW=0 ;;
         --native)     NATIVE=1 ;;
         *) echo "unknown option $a" >&2; exit 1 ;;
@@ -86,11 +87,11 @@ esac
 GW_IMG=kbus-gateway:$VERSION-$ARCH
 CL_IMG=kbus-example-client:$ARCH
 MG_IMG=kbus-manager:$ARCH
-IEC_IMG=kbus-iec104:$ARCH
+IEC_IMG=104-gateway:$ARCH
 GW_TAR=$OUT/kbus-gateway-$VERSION-$ARCH.tar.gz
 CL_TAR=$OUT/kbus-example-client-$ARCH.tar.gz
 MG_TAR=$OUT/kbus-manager-$ARCH.tar.gz
-IEC_TAR=$OUT/kbus-iec104-$ARCH.tar.gz
+IEC_TAR=$OUT/104-gateway-$ARCH.tar.gz
 echo ">>> controller $PFC is $machine -> $PLATFORM"
 
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
@@ -103,10 +104,10 @@ if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
         docker buildx build --platform "$PLATFORM" -t "$1" -f "$ROOT/docker/$3/Dockerfile" --load "${4:-$ROOT/docker/$3}" &&
         docker save "$1" | gzip > "$2" && docker rmi "$1" >/dev/null     # keep only the archive on the PC
     }
-    [[ $GW == 1 ]] && build "$GW_IMG" "$GW_TAR" gateway "$ROOT"
+    [[ $GW == 1 ]] && build "$GW_IMG" "$GW_TAR" kbus-gateway "$ROOT"
     [[ $CL == 1 ]] && build "$CL_IMG" "$CL_TAR" example-client "$ROOT/docker"
     [[ $MG == 1 ]] && build "$MG_IMG" "$MG_TAR" manager
-    [[ $IEC == 1 ]] && build "$IEC_IMG" "$IEC_TAR" iec104 "$ROOT/docker"
+    [[ $IEC == 1 ]] && build "$IEC_IMG" "$IEC_TAR" 104-gateway "$ROOT/docker"
 else
     echo ">>> 1/4 SKIP_BUILD=1: using $OUT"
 fi
@@ -190,18 +191,22 @@ EOF
 fi
 
 if [[ $IEC == 1 ]]; then
-    echo ">>> starting the IEC 104 server on port $IEC_PORT"
+    echo ">>> starting the IEC 104 server 104-gateway on port $IEC_PORT"
     # shellcheck disable=SC2087
     $SSH sh -s <<EOF
 set -e
-mkdir -p /home/kbus-iec104
-C=/home/kbus-iec104/wdx_iec104_config.ini
+mkdir -p /home/104-gateway
+C=/home/104-gateway/wdx_iec104_config.ini
+if [ ! -s \$C ] && [ -s /home/kbus-iec104/wdx_iec104_config.ini ]; then   # old name: keep its parameters
+    cp /home/kbus-iec104/wdx_iec104_config.ini \$C
+    echo "parameter file taken over from /home/kbus-iec104"
+fi
 if [ ! -s \$C ]; then
     docker run --rm --entrypoint cat $IEC_IMG /app/wdx_iec104_config.ini > \$C
     echo "default parameter file created: \$C"
 fi
-docker rm -f kbus-iec104 >/dev/null 2>&1 || true
-docker run -d --name kbus-iec104 --restart unless-stopped -p $IEC_PORT:2404 \
+docker rm -f kbus-iec104 104-gateway >/dev/null 2>&1 || true   # kbus-iec104 = old name (until 2.6.0)
+docker run -d --name 104-gateway --restart unless-stopped -p $IEC_PORT:2404 \
     -v /run/kbus-gateway:/run/kbus-gateway -v \$C:/app/wdx_iec104_config.ini:ro \
     -v /etc/localtime:/etc/localtime:ro $IEC_IMG >/dev/null
 EOF
@@ -209,10 +214,10 @@ fi
 
 echo ">>> 4/4 status"
 # shellcheck disable=SC2016
-$SSH 'sleep 4; docker ps -a --filter name=kbus- --format "{{.Names}}: {{.Status}}";
+$SSH 'sleep 4; docker ps -a --filter name=kbus- --filter name=104-gateway --format "{{.Names}}: {{.Status}}";
       grep "kbus-gateway\[" /var/log/messages | tail -8'
 
-[[ $IEC == 1 ]] && echo ">>> IEC 104: $PFC:$IEC_PORT, common address 1 (parameters: /home/kbus-iec104/wdx_iec104_config.ini)"
+[[ $IEC == 1 ]] && echo ">>> IEC 104: $PFC:$IEC_PORT, common address 1 (parameters: /home/104-gateway/wdx_iec104_config.ini)"
 if [[ $MG == 1 ]]; then
     [[ $MG_LIGHTTPD == 1 ]] && echo ">>> dashboard: http://$PFC/kbus  (WBM in HTTPS-only mode: redirected to https://$PFC/kbus/)"
     [[ $MG_BIND != 127.0.0.1 ]] && echo ">>> dashboard directly: http://$PFC:$MG_PORT/"

@@ -19,6 +19,12 @@ the requests then go through the Unix socket.
                                            SIMULATION node: ResetStatistics and LocalControl
                                            only through the control socket (CONTROL_SOCKET);
                                            local control blocks KBUS writes of other clients
+  tests/test-rest.py <host> raw            SIMULATION node started with KBUS_SIM_450=1 (2.6.0):
+                                           module list, KBus/Exchange (order, cycle counter,
+                                           several modules, errors), RawInput/RawOutput,
+                                           AI status (750-450), KBus/ReadRegister
+  tests/test-rest.py <host> aioff          SIMULATION node with WDX_AI_STATUS_MS=0: AI status
+                                           not available (500, code 15)
   tests/test-rest.py <host> clients --max-clients N
                                            SIMULATION node: parallel clients, idle clients,
                                            503 when WDX_MAX_CLIENTS=N slots are busy
@@ -337,6 +343,10 @@ def mode_write():
 
 def mode_forbidden():
     pid = "0-0-kbus-digitaloutputs-1-value"
+    st, d = run("0-0-kbus-exchange", {"Positions": {"value": [7]}, "Outputs": {"value": [1] * 24}})
+    check("f4", st, st == 403 and d["errors"][0].get("code") == "57", "KBus/Exchange with Outputs: writes disabled")
+    st, d = run("0-0-kbus-exchange", {"Positions": {"value": [7]}})
+    check("f5", st, st == 201, "KBus/Exchange read only still works")
     st, d, _ = req("PATCH", f"{P}/{pid}", body(pid, True))
     check("f1", st, st == 403 and d is not None and "errors" in d, "writes disabled")
     st, _, _ = req("GET", f"{P}/{pid}")
@@ -458,6 +468,10 @@ def mode_control():
     check("k4", st, st == 403 and "local control" in d["errors"][0]["detail"], "local control: KBUS write blocked")
     st, _, _ = req("PATCH", P, batch([(do1, True), ("0-0-kbus-cycletime", 5)]))
     check("k5", st, st == 403, "local control: batch and cycle time blocked")
+    st, d = run("0-0-kbus-exchange", {"Positions": {"value": [7]}, "Outputs": {"value": [1] * 24}})
+    st2, _ = run("0-0-kbus-exchange", {"Positions": {"value": [7]}})
+    check("k5b", (st, st2), st == 403 and d["errors"][0].get("code") == "57" and st2 == 201,
+          "local control: KBus/Exchange with Outputs blocked, read only allowed")
     old = value(reg)
     st, _, _ = req("PATCH", f"{P}/{reg}", body(reg, 7)) if old is not None else (204, None, None)
     check("k6", st, st == 204, "local control: registers stay writable")
@@ -510,12 +524,246 @@ def mode_clients():
     check("q4", st, st == 200, "slots free again")
     req("PATCH", f"{P}/{do2}", body(do2, False))
 
+# ---------------------------------------------------------------------------
+# 2.6.0: raw process data, module list, AI status, register read
+# ---------------------------------------------------------------------------
+M = "/wda/methods"
+
+
+def run(method_id, in_args, query="?result-behavior=sync", ctype="application/vnd.api+json"):
+    """POST a run of a wdx method; return (status, parsed JSON)."""
+    st, d, _ = req("POST", f"{M}/{method_id}/runs{query}",
+                   {"data": {"type": "runs", "attributes": {"inArgs": in_args}}}, ctype)
+    return st, d
+
+
+def out_args(d):
+    return {k: v["value"] for k, v in d["data"]["attributes"]["outArgs"].items()}
+
+
+def exchange(positions, outputs=None):
+    a = {"Positions": {"value": positions}}
+    if outputs is not None:
+        a["Outputs"] = {"value": outputs}
+    st, d = run("0-0-kbus-exchange", a)
+    return st, d
+
+
+def values(*ids):
+    st, d, _ = req("GET", P + "?filter[id]=" + ",".join(ids))
+    return {x["id"]: x["attributes"].get("value") for x in d["data"]} if st == 200 else {}
+
+
+def module_list():
+    """Positions, names, type codes, input/output bytes; also checked against the per-module parameters."""
+    k = "0-0-kbus-module"
+    v = values(k + "positions", k + "names", k + "typecodes", k + "inputbytes", k + "outputbytes")
+    pos = v.get(k + "positions") or []
+    ok = len(pos) > 0 and all(len(v.get(k + x, [])) == len(pos) for x in ("names", "typecodes", "inputbytes", "outputbytes"))
+    for m, p in enumerate(pos, 1):
+        per = values(f"0-0-kbus-modules-{m}-position", f"0-0-kbus-modules-{m}-inputbytes",
+                     f"0-0-kbus-modules-{m}-outputbytes", f"0-0-kbus-modules-{m}-name", f"0-0-kbus-modules-{m}-typecode")
+        ok &= per.get(f"0-0-kbus-modules-{m}-position") == p == m          # position = index m
+        ok &= per.get(f"0-0-kbus-modules-{m}-inputbytes") == v[k + "inputbytes"][m - 1]
+        ok &= per.get(f"0-0-kbus-modules-{m}-outputbytes") == v[k + "outputbytes"][m - 1]
+        ok &= per.get(f"0-0-kbus-modules-{m}-name") == v[k + "names"][m - 1]
+        ok &= per.get(f"0-0-kbus-modules-{m}-typecode") == v[k + "typecodes"][m - 1]
+    return v, ok
+
+
+def mode_raw():
+    k = "0-0-kbus-module"
+    v, ok = module_list()
+    check("m1", v.get(k + "names"), ok and v.get(k + "typecodes") == [455, 559, 34817, 34818, 33793, 671, 657, 450]
+          and v.get(k + "inputbytes") == [8, 0, 1, 0, 1, 12, 24, 8] and v.get(k + "outputbytes") == [0, 8, 0, 1, 0, 12, 24, 0],
+          "module arrays = per-module parameters, position = index m")
+    st, d, _ = req("GET", "/wda")
+    g = values("0-0-gateway-status", "0-0-gateway-version")
+    check("m2", g, g.get("0-0-gateway-status") == "online" and
+          g.get("0-0-gateway-version") == d["data"]["attributes"]["serviceVersion"], "Gateway/Status, Gateway/Version")
+    st, d, r = req("GET", P + "?filter[path]=KBus/ModulePositions,KBus/ModuleNames,KBus/ModuleTypeCodes,"
+                   "KBus/ModuleInputBytes,KBus/ModuleOutputBytes,Gateway/Status,KBus/Healthy,KBus/ConfigurationVersion")
+    check("m3", f"{len(r.encode())} bytes", st == 200 and len(d["data"]) == 8 and len(r.encode()) <= 4096,
+          "example module-list GET, size incl. headers <= 4096")
+    ids = [x["id"] for x in req("GET", P + "?page[limit]=1000")[1]["data"]]
+    check("m4", [i for i in ids if "raw" in i], all(f"0-0-kbus-modules-{m}-raw{d}" not in ids for m in (1, 2, 3, 4, 5, 8)
+                                                for d in ("input", "output"))
+          and all(f"0-0-kbus-modules-{m}-raw{d}" in ids for m in (6, 7) for d in ("input", "output")),
+          "RawInput/RawOutput only for modules without channels")
+
+    # --- order and cycle counter: the mirror (position 7) returns the outputs of the previous cycle
+    st, d = exchange([7], [0xAA] * 24)
+    st, d = exchange([7], list(range(1, 25)))
+    o = out_args(d) if st == 201 else {}
+    check("x1", o, st == 201 and o.get("Inputs") == list(range(1, 25)) and o.get("Positions") == [7]
+          and o.get("Cycle", 0) > o.get("OutputCycle", 0) > 0, "Inputs from the cycle after the write (mirror)")
+    a = d["data"]["attributes"] if d else {}
+    check("x2", a.get("executionStatus"), st == 201 and a.get("executionStatus") == "done" and a.get("timeout") == 0
+          and d["data"]["type"] == "runs" and d["data"]["id"].startswith("0-0-kbus-exchange-")
+          and all(isinstance(x, int) for x in (o.get("Cycle"), o.get("OutputCycle"))), "run: done, timeout 0, numbers")
+    bad, last = 0, 0
+    for n in range(100):
+        pat = [(n * 7 + i) & 0xFF for i in range(24)]
+        st, d = exchange([7], pat)
+        o = out_args(d) if st == 201 else {}
+        bad += not (o.get("Inputs") == pat and o.get("Cycle", 0) > last and o["Cycle"] > o["OutputCycle"])
+        last = o.get("Cycle", last)
+    check("x3", f"{bad} wrong", bad == 0, "100 exchanges: each sees its own bytes, Cycle rises")
+    st, d = exchange([7])
+    o = out_args(d) if st == 201 else {}
+    check("x4", o.get("OutputCycle"), st == 201 and o.get("OutputCycle") == 0 and o.get("Inputs") == pat,
+          "read only (no Outputs): OutputCycle 0, last inputs")
+    st, d = exchange([7], [])
+    check("x4b", st, st == 201 and out_args(d).get("OutputCycle") == 0, "Outputs [] = read only")
+
+    # --- several modules in one request: 750-671 (12) + mirror (24)
+    stp = [0] * 12
+    stp[11] = 0x01                                          # C1: Enable
+    st, d = exchange([6, 7], stp + [5] * 24)
+    o = out_args(d) if st == 201 else {}
+    i = o.get("Inputs", [])
+    check("x5", i, st == 201 and len(i) == 36 and o.get("Positions") == [6, 7] and i[12:] == [5] * 24
+          and i[11] & 0x01 == 0x01, "671 + mirror in one request: 36 input bytes, 671 Ready, mirror")
+    st, d = exchange([7, 6], [6] * 24 + [0] * 12)
+    i = out_args(d).get("Inputs", []) if st == 201 else []
+    check("x6", len(i), st == 201 and i[:24] == [6] * 24 and len(i) == 36, "order of Inputs follows Positions")
+    st, d = run("0-0-kbus-exchange", {"Positions": {"stringValue": ["7"]}, "Outputs": {"stringValue": ["9"] * 24}})
+    check("x7", st, st == 201 and out_args(d).get("Inputs") == [9] * 24, "inArgs as stringValue")
+
+    # --- errors: 400, code 39, nothing written
+    before = value("0-0-kbus-modules-7-rawoutput")
+    cases = [("e1", [99], [0] * 24, "39", "unknown position"),
+             ("e2", [1], [], "39", "module with channels"),
+             ("e3", [3], None, "39", "digital module"),
+             ("e4", [7], [0] * 23, "39", "too few bytes"),
+             ("e5", [6, 7], [0] * 24, "39", "wrong total"),
+             ("e6", [7, 7], [0] * 48, "39", "position twice"),
+             ("e7", [7], [256] + [0] * 23, "39", "byte > 255"),
+             ("e8", [], None, "39", "no positions")]
+    for name, pos, outs, code, note in cases:
+        st, d = exchange(pos, outs)
+        e = d["errors"][0] if d and "errors" in d else {}
+        check(name, (st, e.get("code")), st == 400 and e.get("code") == code, note)
+    check("e9", value("0-0-kbus-modules-7-rawoutput"), value("0-0-kbus-modules-7-rawoutput") == before,
+          "rejected requests wrote nothing")
+    for name, a, code, note in [("e10", {}, "22", "Positions missing"),
+                                ("e11", {"Positions": {"value": "7"}}, "24", "Positions not an array"),
+                                ("e12", {"Positions": {"value": [7]}, "Outputs": {"value": ["1"] * 24}}, "24",
+                                 "Outputs as text in value")]:
+        st, d = run("0-0-kbus-exchange", a)
+        e = d["errors"][0] if d and "errors" in d else {}
+        check(name, (st, e.get("code")), st == 400 and e.get("code") == code, note)
+    st, d = run("0-0-kbus-exchange", {"Positions": {"value": [7]}}, query="?result-behavior=async")
+    check("e13", st, st == 400, "result-behavior=async not offered")
+    st, d = run("0-0-kbus-exchange", {"Positions": {"value": [7]}}, ctype="application/json")
+    check("e14", st, st == 415, "Content-Type must be JSON:API")
+    st, d = run("0-0-kbus-nothing", {})
+    check("e15", (st, d["errors"][0].get("code") if d else None), st == 404 and d["errors"][0].get("code") == "17",
+          "unknown method -> 404, 17")
+    st, d = run("0-0-kbus-healthy", {})
+    check("e16", (st, d["errors"][0].get("code") if d else None), st == 404 and d["errors"][0].get("code") == "19",
+          "a parameter is not a method -> 404, 19")
+    st, d, _ = req("GET", f"{M}/0-0-kbus-exchange/runs/0-0-kbus-exchange-1")
+    check("e17", st, st == 404, "runs are not stored")
+    st, d, _ = req("POST", P, body("0-0-kbus-healthy", True))
+    check("e18", st, st == 405, "POST on /wda/parameters -> 405")
+    st, d, _ = req("GET", M)
+    check("e19", [x["id"] for x in d["data"]] if d else None, st == 200 and
+          [x["id"] for x in d["data"]] == ["0-0-kbus-exchange", "0-0-kbus-readregister"], "GET /wda/methods")
+
+    # --- RawInput / RawOutput
+    ro = "0-0-kbus-modules-7-rawoutput"
+    st, _, _ = req("PATCH", f"{P}/{ro}", body(ro, list(range(100, 124))))
+    time.sleep(0.05)
+    check("r1", (st, value("0-0-kbus-modules-7-rawinput")), st == 204 and value(ro) == list(range(100, 124))
+          and value("0-0-kbus-modules-7-rawinput") == list(range(100, 124)), "PATCH RawOutput, mirror in RawInput")
+    st, d, _ = req("PATCH", f"{P}/{ro}", body(ro, [1] * 23))
+    check("r2", (st, d["errors"][0].get("code") if d else None), st == 400 and d["errors"][0].get("code") == "39",
+          "RawOutput: wrong length -> 39")
+    st, d, _ = req("GET", f"{P}/{ro}")
+    a = d["data"]["attributes"] if d else {}
+    check("r3", a.get("dataType"), a.get("dataType") == "uint8" and a.get("dataRank") == "array"
+          and a.get("stringValue") == [str(x) for x in a.get("value", [])], "uint8 array with stringValue")
+    st, d = definition(ro)
+    check("r4", d["data"]["attributes"]["writeable"] if d else None, d is not None and d["data"]["attributes"]["writeable"],
+          "RawOutput writeable, RawInput not")
+
+    # --- AI status (750-450 at position 8 = AI5..AI8; AI7 shows 850.0 degC)
+    sv, sva = "0-0-kbus-analoginputstatusvalues", "0-0-kbus-analoginputstatusvalid"
+    for _ in range(30):
+        v = values(sv, sva)
+        if all(v.get(sva, [False])):
+            break
+        time.sleep(0.2)
+    check("a1", v, v.get(sva) == [True] * 8 and v.get(sv) == [0, 0, 0, 0, 0, 0, 0x60, 0],
+          "status values: AI7 = 0x0060 (>= 850 degC), all valid")
+    check("a2", value("0-0-kbus-analoginputs-7-status"), value("0-0-kbus-analoginputs-7-status") == 0x60,
+          "KBus/AnalogInputs/7/Status")
+    st, d = definition("0-0-kbus-analoginputs-7-status")
+    check("a3", d["data"]["attributes"] if d else None, d is not None and not d["data"]["attributes"]["writeable"],
+          "status read-only")
+
+    # --- register read
+    def rr(pos, table, reg):
+        return run("0-0-kbus-readregister", {"Position": {"value": pos}, "Table": {"value": table},
+                                             "Register": {"value": reg}})
+    st, d = rr(8, 2, 6)
+    check("g1", out_args(d) if st == 201 else st, st == 201 and out_args(d) == {"Value": 0x60}, "register 6 of AI7")
+    st, d = rr(8, 0, 8)
+    check("g2", out_args(d) if st == 201 else st, st == 201 and out_args(d) == {"Value": 450}, "register 8 = type")
+    st, d = run("0-0-kbus-readregister", {"Position": {"stringValue": "7"}, "Table": {"stringValue": "0"},
+                                          "Register": {"stringValue": "30"}})
+    check("g3", out_args(d) if st == 201 else st, st == 201 and out_args(d) == {"Value": 6570}, "stringValue arguments")
+    st, d = rr(3, 0, 8)
+    a = d["data"]["attributes"] if st == 201 else {}
+    check("g4", a, st == 201 and a.get("executionStatus") == "error" and a.get("title") and a.get("detail")
+          and a.get("code") and "outArgs" not in a, "digital module: executionStatus error, title, detail, code")
+    for name, args_, note in [("g5", (99, 0, 0), "unknown position"), ("g6", (8, 256, 0), "table > 255"),
+                              ("g7", (8, 0, 64), "register > 63")]:
+        st, d = rr(*args_)
+        check(name, st, st == 400 and d["errors"][0].get("code") == "39", note)
+    st, d = run("0-0-kbus-readregister", {"Position": {"value": 8}, "Table": {"value": 0}})
+    check("g8", st, st == 400 and d["errors"][0].get("code") == "22", "Register missing -> 22")
+
+    # --- sizes and timing (simulation, for comparison only)
+    st, d, r = req("POST", f"{M}/0-0-kbus-exchange/runs?result-behavior=sync",
+                   {"data": {"type": "runs", "attributes": {"inArgs": {"Positions": {"value": [6, 7]},
+                                                                       "Outputs": {"value": [255] * 36}}}}})
+    check("s1", f"{len(r.encode())} bytes", st == 201 and len(r.encode()) <= 4096, "exchange answer size incl. headers")
+    t = []
+    for _ in range(200):
+        t0 = time.perf_counter()
+        exchange([6, 7], [0] * 36)
+        t.append((time.perf_counter() - t0) * 1000)
+    t.sort()
+    print(f"INFO  exchange 671+mirror (simulation, cycle {value('0-0-kbus-cycletime')} ms, 200x): "
+          f"median {t[100]:.2f} ms, p95 {t[190]:.2f} ms, max {t[-1]:.2f} ms")
+
+
+def mode_aioff():
+    sva = "0-0-kbus-analoginputstatusvalid"
+    time.sleep(1.5)
+    v = values(sva)
+    check("o1", v, v.get(sva) == [False] * 4, "WDX_AI_STATUS_MS=0: no channel valid")
+    st, d, _ = req("GET", f"{P}/0-0-kbus-analoginputs-1-status")
+    check("o2", (st, d["errors"][0].get("code") if d else None), st == 500 and d["errors"][0].get("code") == "15",
+          "single status without value -> 500, code 15")
+    st, d, _ = req("GET", P + "?filter[path]=KBus/AnalogInputs/1/Status,KBus/Healthy")
+    x = {i["id"]: i["attributes"] for i in d["data"]} if st == 200 else {}
+    a = x.get("0-0-kbus-analoginputs-1-status", {})
+    check("o3", a, st == 200 and "value" not in a and a.get("error", {}).get("code") == "15"
+          and x.get("0-0-kbus-healthy", {}).get("value") is True, "in a list: error attribute, the rest stays valid")
+    st, d = run("0-0-kbus-readregister", {"Position": {"value": 1}, "Table": {"value": 0}, "Register": {"value": 8}})
+    check("o4", out_args(d) if st == 201 else st, st == 201 and out_args(d) == {"Value": 455},
+          "KBus/ReadRegister still works")
+
 
 def main():
     global args
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("host")
-    p.add_argument("mode", choices=["wda", "node", "write", "forbidden", "registers", "clients", "control"])
+    p.add_argument("mode", choices=["wda", "node", "write", "forbidden", "registers", "clients", "control", "raw",
+                                    "aioff"])
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--unix", help="path of the Unix socket (WDX_SOCKET) instead of TCP")
     p.add_argument("--max-clients", type=int, default=16, help="clients mode: WDX_MAX_CLIENTS of the gateway")
@@ -525,7 +773,8 @@ def main():
     p.add_argument("--control", help="control mode: path of the control socket (CONTROL_SOCKET)")
     args = p.parse_args()
     {"wda": mode_wda, "node": mode_node, "write": mode_write, "forbidden": mode_forbidden,
-     "registers": mode_registers, "clients": mode_clients, "control": mode_control}[args.mode]()
+     "registers": mode_registers, "clients": mode_clients, "control": mode_control, "raw": mode_raw,
+     "aioff": mode_aioff}[args.mode]()
     print(f"\nFAILURES: {failures}")
     sys.exit(1 if failures else 0)
 

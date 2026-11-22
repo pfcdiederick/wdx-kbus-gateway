@@ -21,6 +21,7 @@ static struct {
 
     io_channel_t    ch[IO_KIND_COUNT][GW_MAX_CHANNELS];
     size_t          ch_count[IO_KIND_COUNT];
+    uint8_t         mod_has_ch[KBUS_MAX_MODULES];    // 1 = the module has DI/DO/AI/AO channels
     size_t          count_495;
 
     uint8_t         in[KBUS_IMAGE_BYTES];
@@ -28,6 +29,11 @@ static struct {
     size_t          in_len, out_len;
 
     pthread_mutex_t lock;
+    pthread_cond_t  cycle_cond;         // broadcast after every completed cycle (gateway_exchange)
+    uint64_t        seq_started;        // under lock: cycles that took the output image
+    uint64_t        seq_done;           // under lock: last cycle that completed (inputs stored)
+    pthread_mutex_t reg_lock;
+    int             bus_open;           // under reg_lock: the backend is open (register reads allowed)
     pthread_t       thread;
     volatile int    running;
     int             thread_started;
@@ -95,8 +101,10 @@ static void bits_set(uint8_t *img, uint32_t off, uint8_t width, uint32_t v)
 //   exchanged, higher channels still take a number.
 // - Analog: channel k = unsigned 16-bit WORD at byte offset 2*k of the module
 //   data (at most 48 bytes), raw value.
-// - 750-495: no channels, process data not exchanged.
-// - Other modules: no channels; their outputs stay 0.
+// - 750-495 and other complex modules (750-657, 750-671, ...): no channels. Their
+//   process data is exchanged RAW, byte by byte, by clients (CODESYS) through the wdx
+//   method KBus/Exchange and KBus/Modules/<m>/RawInput|RawOutput (gateway_exchange());
+//   the gateway itself never writes their outputs (only 0 at start and rescan).
 // ---------------------------------------------------------------------------
 #define MODULE_DATA_BYTES 48
 #define DIGITAL_MAPPED_CHANNELS 16
@@ -106,6 +114,8 @@ static void add_channel(io_kind_t kind, size_t module_index, unsigned module_cha
 {
     if (gw.ch_count[kind] >= GW_MAX_CHANNELS)
         return;   // channels beyond 250 are not assigned
+    if (module_index < KBUS_MAX_MODULES)
+        gw.mod_has_ch[module_index] = 1;
     if (mapped && (uint64_t)bit_offset + width > (uint64_t)image_len * 8u) {
         LOG_WARN("module %zu: %s channel %u lies outside the process image, not exchanged",
                  module_index + 1, kind_names[kind], module_channel);
@@ -146,12 +156,14 @@ static void build_channel_map(void)
     if (gw.module_count > GW_MAX_MODULES)
         LOG_WARN("%zu modules found, only the first %d are handled", gw.module_count, GW_MAX_MODULES);
 
+    memset(gw.mod_has_ch, 0, sizeof(gw.mod_has_ch));
     for (size_t mi = 0; mi < count; ++mi) {
         const kbus_module_t *m = &gw.modules[mi];
         if (m->type == 495) {
-            // 750-495 power measurement: excluded from the generic handling.
+            // 750-495 power measurement: no channels; its 24 bytes are exchanged raw
+            // (KBus/Exchange), the register communication is done by the client.
             if (gw.count_495++ == 0)
-                LOG_INFO("module %u: 750-495 found; no channels, measured values not available",
+                LOG_INFO("module %u: 750-495 found; no channels, raw process data via KBus/Exchange",
                          m->position);
             continue;
         }
@@ -163,8 +175,8 @@ static void build_channel_map(void)
         } else if (m->out_size_bits && !m->in_size_bits) {
             add_analog(IO_AO, mi, m, m->out_offset_bits, m->out_size_bits, gw.out_len);
         } else if (m->in_size_bits || m->out_size_bits) {
-            LOG_WARN("module %u (75x-%u) is a complex module (in %u / out %u bits), no channels",
-                     m->position, m->type, m->in_size_bits, m->out_size_bits);
+            LOG_INFO("module %u (75x-%u) is a complex module (in %u / out %u bits): no channels, "
+                     "raw process data via KBus/Exchange", m->position, m->type, m->in_size_bits, m->out_size_bits);
         }
     }
 }
@@ -212,6 +224,7 @@ static void *cycle_thread(void *arg)
     while (gw.running) {
         pthread_mutex_lock(&gw.lock);
         memcpy(out_snapshot, gw.out, gw.out_len);
+        const uint64_t seq = ++gw.seq_started;            // this cycle carries every write made so far
         pthread_mutex_unlock(&gw.lock);
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -229,6 +242,8 @@ static void *cycle_thread(void *arg)
             gw.stats.max_cycle_us = us;
         if (rc == 0) {
             memcpy(gw.in, in_buffer, gw.in_len);
+            gw.seq_done = seq;
+            pthread_cond_broadcast(&gw.cycle_cond);       // gateway_exchange() waits for it
             gw.stats.cycles++;
             if (gw.consecutive_errors >= ERRORS_UNTIL_UNHEALTHY) {
                 LOG_INFO("KBUS cycle recovered");
@@ -292,9 +307,17 @@ int gateway_init(const gw_config_t *cfg, kbus_backend_t *backend)
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);  // avoid priority inversion
     pthread_mutex_init(&gw.lock, &attr);
+    pthread_mutex_init(&gw.reg_lock, &attr);
     pthread_mutexattr_destroy(&attr);
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    pthread_cond_init(&gw.cycle_cond, &cattr);
+    pthread_condattr_destroy(&cattr);
 
-    return scan_bus();
+    const int rc = scan_bus();
+    gw.bus_open = rc == 0;
+    return rc;
 }
 
 // Open the bus, read the modules and build the channel map. Used at startup
@@ -357,6 +380,8 @@ int gateway_rescan(void)
     gw.rescan_requested = 0;
     LOG_INFO("KBUS rescan (%s)", automatic ? "after persistent cycle errors" : "requested");
 
+    pthread_mutex_lock(&gw.reg_lock);                  // waits for a running register read
+    gw.bus_open = 0;
     if (gw.thread_started) {
         gw.running = 0;
         pthread_join(gw.thread, NULL);
@@ -374,6 +399,8 @@ int gateway_rescan(void)
     pthread_mutex_unlock(&gw.lock);
 
     const int rc = scan_bus();
+    gw.bus_open = rc == 0;
+    pthread_mutex_unlock(&gw.reg_lock);
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (automatic || rc != 0) {
@@ -432,6 +459,8 @@ int gateway_start(void)
 
 void gateway_stop(void)
 {
+    pthread_mutex_lock(&gw.reg_lock);
+    gw.bus_open = 0;
     if (gw.thread_started) {
         gw.running = 0;
         pthread_join(gw.thread, NULL);
@@ -440,6 +469,7 @@ void gateway_stop(void)
     }
     if (gw.be != NULL)
         gw.be->close(gw.be);
+    pthread_mutex_unlock(&gw.reg_lock);
 }
 
 size_t gateway_channel_count(io_kind_t kind) { return gw.ch_count[kind]; }
@@ -529,6 +559,162 @@ const kbus_module_t *gateway_modules(size_t *count)
 {
     *count = gw.module_count;
     return gw.modules;
+}
+
+int gateway_module_index(uint16_t pos)
+{
+    for (size_t mi = 0; mi < gw.module_count; ++mi)
+        if (gw.modules[mi].position == pos)
+            return (int)mi;
+    return -1;
+}
+
+int gateway_module_has_channels(size_t mi)
+{
+    return mi < gw.module_count && mi < KBUS_MAX_MODULES && gw.mod_has_ch[mi];
+}
+
+// Byte range of the raw data of a module in one direction; 0 = none / not usable raw.
+static size_t raw_range(const kbus_module_t *m, int out, size_t *off)
+{
+    const uint32_t bits = out ? m->out_size_bits : m->in_size_bits;
+    const uint32_t start = out ? m->out_offset_bits : m->in_offset_bits;
+    const size_t img = out ? gw.out_len : gw.in_len;
+    if (bits == 0 || start % 8u != 0)
+        return 0;
+    const size_t n = (bits + 7u) / 8u;
+    if (n > GW_MODULE_RAW_MAX || start / 8u + n > img)
+        return 0;
+    *off = start / 8u;
+    return n;
+}
+
+int gateway_module_raw(size_t mi, size_t *in_bytes, size_t *out_bytes)
+{
+    if (mi >= gw.module_count || gateway_module_has_channels(mi))
+        return 0;
+    const kbus_module_t *m = &gw.modules[mi];
+    size_t off, ni = raw_range(m, 0, &off), no = raw_range(m, 1, &off);
+    // unusable when one direction has data that is not byte aligned or too long
+    if ((m->in_size_bits && ni == 0) || (m->out_size_bits && no == 0) || (ni == 0 && no == 0))
+        return 0;
+    if (in_bytes)
+        *in_bytes = ni;
+    if (out_bytes)
+        *out_bytes = no;
+    return 1;
+}
+
+size_t gateway_module_input(size_t mi, uint8_t *buf, size_t len)
+{
+    size_t off, n;
+    if (!gateway_module_raw(mi, NULL, NULL) || (n = raw_range(&gw.modules[mi], 0, &off)) == 0 || n > len)
+        return 0;
+    pthread_mutex_lock(&gw.lock);
+    memcpy(buf, gw.in + off, n);
+    pthread_mutex_unlock(&gw.lock);
+    return n;
+}
+
+size_t gateway_module_output_read(size_t mi, uint8_t *buf, size_t len)
+{
+    size_t off, n;
+    if (!gateway_module_raw(mi, NULL, NULL) || (n = raw_range(&gw.modules[mi], 1, &off)) == 0 || n > len)
+        return 0;
+    pthread_mutex_lock(&gw.lock);
+    memcpy(buf, gw.out + off, n);
+    pthread_mutex_unlock(&gw.lock);
+    return n;
+}
+
+int gateway_module_output(size_t mi, const uint8_t *buf, size_t len)
+{
+    size_t off, n;
+    if (!gateway_module_raw(mi, NULL, NULL))
+        return GW_ENOENT;
+    if ((n = raw_range(&gw.modules[mi], 1, &off)) == 0)
+        return GW_EREADONLY;
+    if (len != n)
+        return GW_ERANGE;
+    pthread_mutex_lock(&gw.lock);
+    memcpy(gw.out + off, buf, n);
+    pthread_mutex_unlock(&gw.lock);
+    return GW_OK;
+}
+
+int gateway_exchange(const size_t *mi, size_t n, const uint8_t *out, size_t out_len,
+                     uint8_t *in, size_t in_cap, size_t *in_len,
+                     uint64_t *cycle, uint64_t *out_cycle, int timeout_ms)
+{
+    size_t need_out = 0, need_in = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t ni = 0, no = 0;
+        if (!gateway_module_raw(mi[i], &ni, &no))
+            return GW_ENOENT;
+        need_in += ni;
+        need_out += no;
+    }
+    if ((out_len != 0 && out_len != need_out) || need_in > in_cap)
+        return GW_ERANGE;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    timespec_add_ns(&deadline, (long)timeout_ms * 1000000L);
+
+    pthread_mutex_lock(&gw.lock);
+    uint64_t want = gw.seq_done + 1;                    // read only: the next completed cycle (fresh)
+    *out_cycle = 0;
+    if (out_len) {
+        size_t o = 0;
+        for (size_t i = 0; i < n; ++i) {               // all modules in the SAME cycle
+            size_t off = 0, no = raw_range(&gw.modules[mi[i]], 1, &off);
+            memcpy(gw.out + off, out + o, no);
+            o += no;
+        }
+        *out_cycle = gw.seq_started + 1;               // the next cycle takes these outputs
+        want = *out_cycle + 1;                         // inputs from the cycle AFTER it
+    }
+    while (gw.seq_done < want) {
+        if (pthread_cond_timedwait(&gw.cycle_cond, &gw.lock, &deadline) == ETIMEDOUT && gw.seq_done < want) {
+            pthread_mutex_unlock(&gw.lock);
+            return GW_ETIMEOUT;
+        }
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t off = 0, ni = raw_range(&gw.modules[mi[i]], 0, &off);
+        memcpy(in + o, gw.in + off, ni);
+        o += ni;
+    }
+    *in_len = o;
+    *cycle = gw.seq_done;
+    pthread_mutex_unlock(&gw.lock);
+    return GW_OK;
+}
+
+uint64_t gateway_cycle_number(void)
+{
+    pthread_mutex_lock(&gw.lock);
+    const uint64_t c = gw.seq_done;
+    pthread_mutex_unlock(&gw.lock);
+    return c;
+}
+
+int gateway_reg_read(uint16_t pos, uint16_t table, uint16_t reg, uint16_t count, uint16_t *buf, uint16_t *n)
+{
+    if (count == 0 || count > 16)
+        return GW_ERANGE;
+    if (gw.be == NULL || gw.be->reg_read == NULL)
+        return GW_EUNAVAILABLE;
+    pthread_mutex_lock(&gw.reg_lock);
+    int rc = GW_EOFFLINE;
+    if (gw.bus_open) {
+        *n = 0;
+        const int r = gw.be->reg_read(gw.be, pos, table, reg, count, buf, n);
+        rc = r == KBUS_REG_OK ? GW_OK : r == KBUS_REG_UNAVAILABLE ? GW_EUNAVAILABLE : GW_EFAILED;
+    }
+    pthread_mutex_unlock(&gw.reg_lock);
+    return rc;
 }
 
 void gateway_stats(gw_stats_t *out)

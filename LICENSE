@@ -21,7 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 Third-party parts keep their own licence:
-- docs/reference/HowTo_ADI-MyKBusApplikation/: WAGO example, MIT licence, see its License file.
-- The WAGO SDK header files (sdk/include/dal/, ldkc_kbus_information.h) are
+- The KBUS access follows the WAGO example HowTo_ADI-MyKBusApplikation (MIT licence).
+- The WAGO SDK header files (sdk/include/dal/, ldkc_kbus_*.h) are
   NOT included; they are proprietary and must be imported from a WAGO
-  firmware SDK (see sdk/README.md).
+  firmware SDK (see docs/MANUAL.md, 2.2).

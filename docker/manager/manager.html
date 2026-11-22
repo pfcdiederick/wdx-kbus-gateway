@@ -122,24 +122,9 @@ table.grid tr:last-child td { border-bottom: none; }
 .toolbar { display: flex; gap: 17px; align-items: center; padding: 9px; }
 .toolbar input[type=search] { max-width: 307px; }
 
-/* I/O: LEDs, output buttons, analog values */
-.io-grid { display: flex; flex-wrap: wrap; gap: 9px; padding: 9px; }
-.io-item { width: 64px; text-align: center; font-size: 11px; text-transform: uppercase; }
-.io-item .lamp { width: 26px; height: 26px; margin: 4px auto; border-radius: 50%; border: 1px solid rgb(120, 120, 120); background: rgb(230, 230, 230); }
-.io-item .lamp.on { background: rgb(185, 214, 129); border-color: var(--green-dark); }
-/* digital outputs: the ON/OFF button shows the state and switches (no lamp) */
-.io-item button { display: block; min-width: 0; width: 64px; height: 30px; margin: 4px auto 0; padding: 0; font-size: 11px; }
-/* digital inputs: the same box as the output buttons, but only a display */
-.io-item .io-state { box-sizing: border-box; width: 64px; height: 30px; margin: 4px auto 0; line-height: 28px;
-  border: 1px solid var(--green-dark); border-radius: 2px; background: #fff; color: var(--green-dark); cursor: default; }
-.io-item .io-state.on { background: var(--green); color: #fff; }
-.io-item .sub { color: rgb(120, 120, 120); text-transform: none; }
-.analog { display: grid; grid-template-columns: 60px 1fr 70px; gap: 6px 12px; align-items: center; padding: 9px; }
-.analog .bar { height: 10px; border: 1px solid var(--line); border-radius: 2px; background: #fff; overflow: hidden; }
-.analog .bar > div { height: 100%; background: var(--green); width: 0; }
-.analog .num { text-align: right; font-variant-numeric: tabular-nums; }
+/* Parameters: input field + Set button of a writeable parameter (under local control) */
 .aorow { display: flex; gap: 9px; align-items: center; }
-.aorow input { width: 110px; }
+.aorow input, .aorow select { width: 160px; }
 
 /* ---- status area (bottom bar) ---- */
 #status-area { flex: none; height: 50px; background: var(--bar); border-top: 1px solid var(--line);
@@ -194,9 +179,36 @@ body.logged-in .anon-only { display: none !important; }
     <div class="sub-content">
       <p id="msg"></p>
 
-      <!-- Status / KBUS Status -->
+      <!-- Status / COM1 -->
+      <div class="wbm-page" id="page-status-serial">
+        <h2 class="page">COM1</h2>
+        <p class="note">The gateway forwards COM1 transparently over WDX (<code>Serial/Com1/...</code>). The settings are made
+          on the client side: the client (CODESYS) writes
+          <code>Serial/Com1/Baudrate</code>, <code>Format</code> and <code>FrameGap</code>; this page only shows them (read only). RS-232 / RS-485 is set in the WBM
+          (Interfaces &gt; Serial Interface, owner "None").</p>
+        <p class="note" id="ser-off" style="display:none">COM1 is off in the gateway (SERIAL_DEVICE empty).</p>
+        <div class="form collapsible" id="ser-form"><span class="title">Communication Parameters</span><div class="body">
+          <div class="field"><label>Device</label><div class="control" id="ser-device">–</div></div>
+          <div class="field"><label>State</label><div class="control" id="ser-open">–</div></div>
+          <div class="field"><label>Baud Rate</label><div class="control value" id="ser-baud">–</div></div>
+          <div class="field"><label>Format</label><div class="control value" id="ser-format">–</div></div>
+          <div class="field"><label>Frame Gap</label><div class="control value" id="ser-gap"
+            title="A pause of this length ends a received frame">–</div></div>
+        </div></div>
+        <div class="form collapsible" id="ser-mon"><span class="title">Monitor</span><div class="body">
+          <div class="field"><label>Sent / Received</label><div class="control value" id="ser-counts">–</div></div>
+          <div class="field"><label>Frames / Errors</label><div class="control value" id="ser-frames">–</div></div>
+          <div class="field"><label>Last Frame</label><div class="control value mono" id="ser-frame">–</div></div>
+          <div class="field"><label>Received (last 512 bytes)</label><div class="control value mono" id="ser-rx" style="word-break:break-all">–</div></div>
+          <div class="field"><label for="ser-tx">Send (test)</label><div class="control"><input type="text" id="ser-tx" maxlength="200"
+            placeholder="text; \r \n \xNN for bytes"></div></div>
+          <div class="buttons"><button class="w" id="ser-send">Send</button></div>
+        </div></div>
+      </div>
+
+      <!-- Status / KBUS -->
       <div class="wbm-page" id="page-status-kbus">
-        <h2 class="page">KBUS Status</h2>
+        <h2 class="page">KBUS</h2>
         <div class="form collapsible"><span class="title">KBUS</span><div class="body">
           <div class="field"><label>State</label><div class="control" id="st-healthy">–</div></div>
           <div class="field"><label>Cycle Time</label><div class="control value" id="st-cycletime">–</div></div>
@@ -218,48 +230,30 @@ body.logged-in .anon-only { display: none !important; }
       <div class="wbm-page" id="page-status-modules">
         <h2 class="page">KBUS Modules</h2>
         <div class="form wide"><span class="title">Modules on the KBUS</span><div class="body">
-          <table class="grid"><thead><tr><th>#</th><th>Name</th><th>Type Code</th><th>Channels</th></tr></thead>
+          <table class="grid"><thead><tr><th>#</th><th>Name</th><th>Type Code</th><th>Channels</th><th>Bytes In / Out</th><th>Raw Data</th></tr></thead>
             <tbody id="modules"></tbody></table>
         </div></div>
       </div>
 
-      <!-- I/O / Process Image -->
-      <div class="wbm-page" id="page-io-process">
-        <h2 class="page">Process Image</h2>
-        <p class="note">Live values of all KBUS channels. Outputs are switched at once; another program
-          that writes the same outputs (e.g. CODESYS) overwrites them in its next cycle, unless you take local control.</p>
-        <div class="form wide"><span class="title">Control</span><div class="body">
-          <div class="field"><label>KBUS Outputs</label><div class="control" id="io-localcontrol">–</div></div>
-          <div class="buttons auth-only"><button class="w assertive" id="localctl" title="Local control: only this dashboard may write the KBUS">Take Local Control</button></div>
-          <p class="note anon-only" style="margin:6px 0 0">Log in (gear button at the top right) to take local control.</p>
-        </div></div>
-        <div class="form wide"><span class="title">Digital Inputs</span><div class="body"><div class="io-grid" id="io-di"></div></div></div>
-        <div class="form wide"><span class="title">Digital Outputs</span><div class="body"><div class="io-grid" id="io-do"></div></div></div>
-        <div class="form wide"><span class="title">Analog Inputs (raw 0–65535)</span><div class="body"><div class="analog" id="io-ai"></div></div></div>
-        <div class="form wide"><span class="title">Analog Outputs (raw 0–65535)</span><div class="body"><div class="analog" id="io-ao"></div></div></div>
-      </div>
 
       <!-- Parameters / All Parameters -->
       <div class="wbm-page" id="page-params-all">
         <h2 class="page">Parameters</h2>
+        <p class="note">All parameters of the WDX data layer, live. To change values, log in (gear button at the top
+          right) and take local control: CODESYS and all other clients can then no longer write the KBUS outputs, and
+          every writeable parameter gets an input field (arrays as JSON, e.g. <code>[1,0,255]</code>).</p>
+        <div class="form wide"><span class="title">Control</span><div class="body">
+          <div class="field"><label>KBUS Outputs</label><div class="control" id="par-localcontrol">–</div></div>
+          <div class="buttons auth-only"><button class="w assertive" id="localctl" title="Local control: only this dashboard may write the KBUS">Take Local Control</button></div>
+          <p class="note anon-only" style="margin:6px 0 0">Log in (gear button at the top right) to take local control.</p>
+        </div></div>
         <div class="form wide"><span class="title">WDX Data Layer</span><div class="body">
           <div class="toolbar"><input type="search" id="pfilter" placeholder="Filter by path or id"><span id="pcount"></span></div>
-          <table class="grid"><thead><tr><th>Path</th><th>Id</th><th>Type</th><th>Value</th><th>Writeable</th><th>Persistent</th></tr></thead>
+          <table class="grid"><thead><tr><th>Path</th><th>Id</th><th>Type</th><th>Value</th><th>Writeable</th><th>Persistent</th><th class="edit-col">New Value</th></tr></thead>
             <tbody id="ptable"></tbody></table>
         </div></div>
       </div>
 
-      <!-- Registers -->
-      <div class="wbm-page" id="page-regs-registers">
-        <h2 class="page">Registers</h2>
-        <p class="note">Declared in /etc/kbus-gateway-registers.conf on the controller; restart the gateway after a change.
-          Register changes so far: <b id="cc">–</b></p>
-        <div class="form wide"><span class="title">Registers</span><div class="body">
-          <table class="grid"><thead><tr><th>Register</th><th>Type</th><th>Current Value</th><th>New Value</th><th></th><th>Persistent</th></tr></thead>
-            <tbody id="rtable"></tbody></table>
-          <p id="rnone" style="display:none;padding:0 9px">No registers declared.</p>
-        </div></div>
-      </div>
 
       <!-- Settings / KBUS -->
       <div class="wbm-page" id="page-settings-cycle">
@@ -269,33 +263,6 @@ body.logged-in .anon-only { display: none !important; }
           <div class="field"><label>Current Cycle Time</label><div class="control value" id="cyc-now">–</div></div>
           <div class="field"><label>New Cycle Time (ms)</label><div class="control"><input type="number" id="cyc" min="1" max="40" step="1"></div></div>
           <div class="buttons"><button class="w action" id="cycset">Submit</button></div>
-        </div></div>
-      </div>
-
-      <!-- Settings / COM1 -->
-      <div class="wbm-page" id="page-settings-serial">
-        <h2 class="page">COM1</h2>
-        <p class="note">The gateway forwards COM1 transparently over WDX (<code>Serial/Com1/...</code>). The settings are made
-          on the client side: CODESYS sets them with <code>FB_WdaSerial</code> (inputs <code>udiSetBaudrate</code>,
-          <code>sSetFormat</code>, <code>uiSetFrameGap</code>); this page shows them. RS-232 / RS-485 is set in the WBM
-          (Interfaces &gt; Serial Interface, owner "None").</p>
-        <p class="note" id="ser-off" style="display:none">COM1 is off in the gateway (SERIAL_DEVICE empty).</p>
-        <div class="form collapsible" id="ser-form"><span class="title">Settings (set by CODESYS)</span><div class="body">
-          <div class="field"><label>Device</label><div class="control" id="ser-device">–</div></div>
-          <div class="field"><label>State</label><div class="control" id="ser-open">–</div></div>
-          <div class="field"><label>Baud Rate</label><div class="control value" id="ser-baud">–</div></div>
-          <div class="field"><label>Format</label><div class="control value" id="ser-format">–</div></div>
-          <div class="field"><label>Frame Gap</label><div class="control value" id="ser-gap"
-            title="A pause of this length ends a received frame">–</div></div>
-        </div></div>
-        <div class="form collapsible" id="ser-mon"><span class="title">Monitor</span><div class="body">
-          <div class="field"><label>Sent / Received</label><div class="control value" id="ser-counts">–</div></div>
-          <div class="field"><label>Frames / Errors</label><div class="control value" id="ser-frames">–</div></div>
-          <div class="field"><label>Last Frame</label><div class="control value mono" id="ser-frame">–</div></div>
-          <div class="field"><label>Received (last 512 bytes)</label><div class="control value mono" id="ser-rx" style="word-break:break-all">–</div></div>
-          <div class="field"><label for="ser-tx">Send (test)</label><div class="control"><input type="text" id="ser-tx" maxlength="200"
-            placeholder="text; \r \n \xNN for bytes"></div></div>
-          <div class="buttons"><button class="w" id="ser-send">Send</button></div>
         </div></div>
       </div>
 
@@ -342,17 +309,15 @@ const READONLY = __READONLY__;
 const P = "wda/parameters";       // relative: works at / and behind a prefix (/kbus/)
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const show = v => typeof v === "string" ? JSON.stringify(v) : Array.isArray(v) ? "[" + v.map(show).join(", ") + "]" : String(v);
+const show = v => v === undefined ? "–" : typeof v === "string" ? JSON.stringify(v) : Array.isArray(v) ? "[" + v.map(show).join(", ") + "]" : String(v);
 
 // ---- navigation: main menu (tabs) and sub menu, like the WBM ---------------
 const MENU = [
-  { id: "status", title: "Status", pages: [["kbus", "KBUS Status"], ["modules", "Modules"]] },
-  { id: "io", title: "I/O", pages: [["process", "Process Image"]] },
+  { id: "status", title: "Status", pages: [["serial", "COM1"], ["kbus", "KBUS"], ["modules", "Modules"]] },
   { id: "params", title: "Parameters", pages: [["all", "All Parameters"]] },
-  { id: "regs", title: "Registers", pages: [["registers", "Registers"]] },
-  { id: "settings", title: "Settings", pages: [["cycle", "KBUS"], ["serial", "COM1"], ["login", "Login"]] },
+  { id: "settings", title: "Settings", pages: [["cycle", "KBUS"], ["login", "Login"]] },
 ];
-let tab = "status", page = "kbus";
+let tab = "status", page = "serial";
 $("main-menu").innerHTML = MENU.map(m =>
   `<li class="tab-item" data-tab="${m.id}"><a href="#/${m.id}">${esc(m.title)}</a></li>`).join("");
 function route() {
@@ -462,7 +427,7 @@ async function loadDefs() {
   defs = d.data;
   byId = Object.fromEntries(defs.map(x => [x.id, x]));
   configVersion = byId["0-0-kbus-configurationversion"] ? byId["0-0-kbus-configurationversion"].value : null;
-  renderModules(); renderParams(); renderRegs(); buildIO();
+  renderModules(); renderParams();
 }
 
 // ---- status ---------------------------------------------------------------
@@ -477,7 +442,6 @@ function renderStatus(v) {
     else if (k === "localcontrol") showLocal(v[id]);
     else el.textContent = v[id] + (UNIT[k] || "");
   }
-  if ("0-0-registers-changecounter" in v) $("cc").textContent = v["0-0-registers-changecounter"];
   if ("0-0-kbus-cycletime" in v) {
     $("cyc-now").textContent = v["0-0-kbus-cycletime"] + " ms";
     if (document.activeElement !== $("cyc") && $("cyc").value === "") $("cyc").value = v["0-0-kbus-cycletime"];
@@ -488,102 +452,67 @@ function renderStatus(v) {
 function renderModules() {
   const mods = (byId["0-0-kbus-modules"] || {}).value || [];
   const g = (m, k) => esc((byId[`0-0-kbus-modules-${m}-${k}`] || {}).value);
-  $("modules").innerHTML = mods.map((_, i) => i + 1).map(m => `<tr><td>${m}</td><td>${g(m, "name")}</td><td>${g(m, "typecode")}</td><td>${g(m, "channelcount")}</td></tr>`).join("")
-    || `<tr><td colspan="4">No modules on the KBUS.</td></tr>`;
+  $("modules").innerHTML = mods.map((_, i) => i + 1).map(m => `<tr><td>${m}</td><td>${g(m, "name")}</td><td>${g(m, "typecode")}</td>`
+    + `<td>${g(m, "channelcount")}</td><td>${g(m, "inputbytes")} / ${g(m, "outputbytes")}</td>`
+    + `<td>${byId[`0-0-kbus-modules-${m}-rawinput`] || byId[`0-0-kbus-modules-${m}-rawoutput`] ? "KBus/Exchange" : ""}</td></tr>`).join("")
+    || `<tr><td colspan="6">No modules on the KBUS.</td></tr>`;
 }
 
-// ---- I/O ------------------------------------------------------------------
-const CLS = { di: ["digitalinputs", "digitalinputvalues"], do: ["digitaloutputs", "digitaloutputvalues"],
-              ai: ["analoginputs", "analoginputvalues"], ao: ["analogoutputs", "analogoutputvalues"] };
-function where(c, n) {
-  const m = (byId[`0-0-kbus-${CLS[c][0]}-${n}-module`] || {}).value, ch = (byId[`0-0-kbus-${CLS[c][0]}-${n}-modulechannel`] || {}).value;
-  return m ? `module ${m}, channel ${ch}` : "";
-}
-function buildIO() {
-  const count = c => ((byId["0-0-kbus-" + CLS[c][1]] || {}).value || []).length;
-  $("io-di").innerHTML = [...Array(count("di"))].map((_, i) =>
-    `<div class="io-item" title="${where("di", i + 1)}">DI${i + 1}<div class="io-state" id="di-${i}" role="status" aria-label="DI${i + 1}">OFF</div></div>`).join("") || "<span>none</span>";
-  $("io-do").innerHTML = [...Array(count("do"))].map((_, i) =>
-    `<div class="io-item" title="${where("do", i + 1)}">DO${i + 1}`
-    + `<button class="w" data-do="${i + 1}" id="dob-${i}" aria-label="DO${i + 1}">OFF</button></div>`).join("") || "<span>none</span>";
-  $("io-ai").innerHTML = [...Array(count("ai"))].map((_, i) =>
-    `<span title="${where("ai", i + 1)}">AI${i + 1}</span><div class="bar"><div id="aib-${i}"></div></div><span class="num" id="ai-${i}">–</span>`).join("") || "<span>none</span>";
-  $("io-ao").innerHTML = [...Array(count("ao"))].map((_, i) =>
-    `<span title="${where("ao", i + 1)}">AO${i + 1}</span><div class="aorow"><div class="bar" style="flex:1"><div id="aob-${i}"></div></div>`
-    + `<input type="number" min="0" max="65535" id="aoi-${i}"><button class="w small" data-ao="${i + 1}">Set</button></div>`
-    + `<span class="num" id="ao-${i}">–</span>`).join("") || "<span>none</span>";
-  applyReadonly();
-}
-function renderIO(v) {
-  (v["0-0-kbus-digitalinputvalues"] || []).forEach((x, i) => {
-    const d = $("di-" + i);
-    if (d) { d.classList.toggle("on", x); d.textContent = x ? "ON" : "OFF"; }
-  });
-  (v["0-0-kbus-digitaloutputvalues"] || []).forEach((x, i) => {
-    const b = $("dob-" + i);
-    if (b) { b.textContent = x ? "ON" : "OFF"; b.classList.toggle("action", x); b.dataset.state = x ? "1" : "0";
-             b.setAttribute("aria-pressed", x ? "true" : "false"); }
-  });
-  for (const c of ["ai", "ao"]) (v[`0-0-kbus-${CLS[c][1]}`] || []).forEach((x, i) => {
-    const n = $(`${c}-${i}`), b = $(`${c}b-${i}`);
-    if (n) n.textContent = x; if (b) b.style.width = (x / 655.35).toFixed(1) + "%";
-  });
-}
-document.addEventListener("click", e => {
-  const d = e.target.closest("[data-do]");
-  if (d) return patch(`0-0-kbus-digitaloutputs-${d.dataset.do}-value`, d.dataset.state !== "1", true).then(refresh);
-  const a = e.target.closest("[data-ao]");
-  if (a) {
-    const v = Number($("aoi-" + (a.dataset.ao - 1)).value);
-    if (!Number.isInteger(v) || v < 0 || v > 65535) return msg("Analog output: whole number 0..65535");
-    patch(`0-0-kbus-analogoutputs-${a.dataset.ao}-value`, v).then(refresh);
-  }
-});
 
 // ---- parameters -------------------------------------------------------------
+// Editing: only while this dashboard has local control (logged in) and the manager may write.
+// Local control itself is switched with its button, not in the table.
+const editable = x => x.writeable && x.id !== "0-0-kbus-localcontrol";
+const canEdit = () => !!localOn && !!auth && !READONLY;
+function editCell(x) {
+  if (!editable(x)) return "";
+  const id = esc(x.id);
+  let input;
+  if (x.dataType === "boolean" && x.dataRank !== "array")
+    input = `<select data-in="${id}"><option>false</option><option>true</option></select>`;
+  else if (x.dataRank !== "array" && x.dataType !== "string")
+    input = `<input type="number" step="${x.dataType === "float64" ? "any" : "1"}" data-in="${id}">`;
+  else
+    input = `<input type="text" data-in="${id}" placeholder="${x.dataRank === "array" ? "JSON array" : "text"}">`;
+  return `<div class="aorow">${input}<button class="w small" data-set="${id}">Set</button></div>`;
+}
 function renderParams() {
   const f = $("pfilter").value.trim().toLowerCase();
   const rows = defs.filter(x => !f || x.path.toLowerCase().includes(f) || x.id.includes(f));
+  const edit = canEdit();
   $("pcount").textContent = `${rows.length} of ${defs.length} parameters`;
+  document.querySelectorAll(".edit-col").forEach(th => th.style.display = edit ? "" : "none");
   $("ptable").innerHTML = rows.map(x => `<tr><td>${esc(x.path)}</td>`
     + `<td class="mono"><a href="wda/parameter-definitions/${esc(x.id)}" target="_blank">${esc(x.id)}</a></td>`
     + `<td>${esc(x.dataType)}${x.dataRank === "array" ? "[]" : ""}</td>`
     + `<td class="val mono" data-id="${esc(x.id)}">${esc(show(x.value))}</td>`
-    + `<td>${x.writeable ? "yes" : ""}</td><td>${x.userSetting ? "yes" : ""}</td></tr>`).join("");
-}
-$("pfilter").addEventListener("input", renderParams);
-
-// ---- registers ----------------------------------------------------------------
-function regs() { return defs.filter(x => x.path.startsWith("Registers/") && x.path.endsWith("/Value")); }
-function renderRegs() {
-  const list = regs();
-  $("rnone").style.display = list.length ? "none" : "";
-  $("rtable").innerHTML = list.map(x => {
-    const name = x.path.slice(10, -6);
-    let input;
-    if (x.dataType === "boolean") input = `<select data-in="${esc(x.id)}"><option>false</option><option>true</option></select>`;
-    else if (x.dataType === "string") input = `<input type="text" maxlength="127" data-in="${esc(x.id)}">`;
-    else input = `<input type="number" step="${x.dataType === "float64" ? "any" : "1"}" data-in="${esc(x.id)}">`;
-    return `<tr><td>${esc(name)}</td><td>${esc(x.dataType)}</td>`
-      + `<td class="val mono" data-id="${esc(x.id)}">${esc(show(x.value))}</td>`
-      + `<td style="width:220px">${input}</td><td><button class="w small" data-set="${esc(x.id)}" data-type="${esc(x.dataType)}">Set</button></td>`
-      + `<td>${x.userSetting ? "yes" : ""}</td></tr>`;
-  }).join("");
+    + `<td>${x.writeable ? "yes" : ""}</td><td>${x.userSetting ? "yes" : ""}</td>`
+    + (edit ? `<td style="min-width:220px">${editCell(x)}</td>` : "") + `</tr>`).join("");
   applyReadonly();
 }
+$("pfilter").addEventListener("input", renderParams);
 document.addEventListener("click", e => {
   const b = e.target.closest("[data-set]");
   if (!b) return;
-  const id = b.dataset.set, t = b.dataset.type;
-  const inp = document.querySelector(`[data-in="${CSS.escape(id)}"]`);
-  let v = inp.value;
-  if (t === "boolean") v = v === "true";
-  else if (t !== "string") {
-    if (v.trim() === "") return msg("Enter a value first.");
-    v = Number(v);
+  const x = byId[b.dataset.set];
+  if (!x) return;
+  if (!canEdit()) return msg("Take local control first (Parameters page).");
+  const raw = document.querySelector(`[data-in="${CSS.escape(x.id)}"]`).value;
+  let v;
+  if (x.dataRank === "array") {
+    try { v = JSON.parse(raw); } catch (err) { return msg("Enter a JSON array, e.g. [1,0,255]."); }
+    if (!Array.isArray(v)) return msg("Enter a JSON array, e.g. [1,0,255].");
+  } else if (x.dataType === "boolean") v = raw === "true";
+  else if (x.dataType === "string") v = raw;
+  else {
+    if (raw.trim() === "") return msg("Enter a value first.");
+    v = Number(raw);
   }
-  patch(id, v).then(refresh);
+  if (x.id === "0-0-kbus-rescan" && v === true && !confirm("Rescan the KBUS? All outputs go to 0 for a moment.")) return;
+  if (x.id === "0-0-kbus-resetstatistics") return protectedPatch(x.id, v, "Reset Statistics").then(refresh);
+  patch(x.id, v).then(refresh);
 });
+
 
 // ---- settings -----------------------------------------------------------------
 let settings = null;
@@ -603,6 +532,7 @@ async function loadSettings() {
 }
 function showLogin() {
   document.body.classList.toggle("logged-in", !!auth);
+  if (typeof renderParams === "function" && defs.length) renderParams();   // edit column needs the login
   led("led-login", auth ? "green" : "yellow",
       auth ? `Logged in as ${authUser}` : "Not logged in: Reset Statistics and Local Control are hidden");
   $("login-label").textContent = auth ? "Logout" : "Login";
@@ -616,14 +546,16 @@ $("login-btn").addEventListener("click", loginClick);
 $("login-btn").addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); loginClick(); } });
 let localOn = null;
 function showLocal(on) {
-  localOn = !!on;
-  for (const el of [$("st-localcontrol"), $("io-localcontrol")]) {
+  const changed = localOn !== !!on;
+  for (const el of [$("st-localcontrol"), $("par-localcontrol")]) {
     el.className = "control " + (on ? "bad-text" : "");
     el.textContent = on ? "LOCAL: only this dashboard writes the KBUS (CODESYS and other clients are blocked)"
-                        : "Remote: all clients may write the KBUS";
+                        : "Remote: all clients may write the KBUS (the values here are read only)";
   }
   $("localctl").textContent = on ? "Release Local Control" : "Take Local Control";
   led("led-local", on ? "yellow" : "", on ? "Local control: only the dashboard writes the KBUS" : "Remote control");
+  localOn = !!on;
+  if (changed) renderParams();                         // edit column on / off
 }
 $("sform").addEventListener("submit", async e => {
   e.preventDefault();
@@ -704,14 +636,11 @@ async function clock() {
     $("clock").innerHTML = `${esc(d.date)}<br>${esc(d.time)}`;
   } catch (e) { /* keep the last time */ }
 }
-const IO_IDS = Object.values(CLS).map(c => "0-0-kbus-" + c[1]);
 // ids the current page shows; null = Parameters tab (all parameters, polled)
 function pageIds() {
   if (tab === "params") return null;
   let ids = STATUS_IDS;
-  if (tab === "io") ids = ids.concat(IO_IDS);
-  if (tab === "regs") ids = ids.concat(regs().map(x => x.id));
-  if (tab === "settings" && page === "serial") ids = ids.concat(SER_IDS);
+  if (tab === "status" && page === "serial") ids = ids.concat(SER_IDS);
   return ids;
 }
 
@@ -721,12 +650,11 @@ let loadingDefs = false;
 function render(v) {
   Object.assign(live, v);
   renderStatus(live);
-  if (tab === "io") renderIO(live);
-  if (tab === "settings" && page === "serial") renderSerial(live);
+  if (tab === "status" && page === "serial") renderSerial(live);
   for (const id in v) {
     const def = byId[id];
     if (def) def.value = v[id];
-    if (tab === "params" || tab === "regs")
+    if (tab === "params")
       document.querySelectorAll(`td[data-id="${CSS.escape(id)}"]`).forEach(td => td.textContent = show(v[id]));
   }
   led("led-gw", "green", "kbus-gateway reachable");
@@ -778,11 +706,11 @@ loadSettings();
 clock(); setInterval(clock, 1000);
 route();
 loadDefs().then(() => { refresh(); startEvents(); }).catch(e => msg(e.message));
-let tick = 0;            // fallback without live values: I/O every 300 ms, other pages every 900 ms
+let tick = 0;            // fallback without live values: every 900 ms
 setInterval(() => {
   tick++;
   if (es && Date.now() - esLast < 3000) return;       // live values arrive: no polling
-  if (tab === "io" || tick % 3 === 0) refresh();
+  if (tick % 3 === 0) refresh();
 }, 300);
 </script>
 </body>

@@ -66,6 +66,11 @@ void config_load(gw_config_t *cfg)
     cfg->client_timeout_ms = env_int("WDX_CLIENT_TIMEOUT_MS", 5000, 100, 60000);
     cfg->event_ms       = env_int("WDX_EVENT_MS", 10, 2, 1000);
     cfg->max_streams    = env_int("WDX_MAX_STREAMS", 4, 0, 16);
+    cfg->ai_status_ms   = env_int("WDX_AI_STATUS_MS", 1000, 0, 3600000);
+    if (cfg->ai_status_ms > 0 && cfg->ai_status_ms < 1000) {
+        LOG_WARN("WDX_AI_STATUS_MS=%d is below the minimum, using 1000", cfg->ai_status_ms);
+        cfg->ai_status_ms = 1000;
+    }
     cfg->register_file  = env_str("REGISTER_FILE", "/etc/kbus-gateway-registers.conf");
     cfg->register_store = env_str_empty("REGISTER_STORE", "/home/kbus-gateway/registers.dat");
     cfg->register_save_s = env_int("REGISTER_SAVE_S", 10, 1, 3600);

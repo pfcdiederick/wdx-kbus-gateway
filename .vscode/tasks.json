@@ -45,9 +45,9 @@
             "problemMatcher": []
         },
         {
-            "label": "deploy containers: IEC 104 server only",
+            "label": "deploy containers: 104-gateway (IEC 104) only",
             "type": "shell",
-            "command": "tools/deploy-docker.sh ${input:pfcIp} --iec104 --no-gateway",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --104-gateway --no-gateway",
             "problemMatcher": []
         },
         {

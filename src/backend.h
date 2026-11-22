@@ -23,6 +23,8 @@ typedef struct {
     uint16_t pi_format;
 } kbus_module_t;
 
+enum { KBUS_REG_OK = 0, KBUS_REG_FAILED = -1, KBUS_REG_UNAVAILABLE = -2 };
+
 typedef struct kbus_backend kbus_backend_t;
 
 struct kbus_backend {
@@ -34,6 +36,13 @@ struct kbus_backend {
     int  (*exchange)(kbus_backend_t *self, const uint8_t *out, size_t out_len,
                      uint8_t *in, size_t in_len);
     void (*close)(kbus_backend_t *self);
+    // Register communication, READ ONLY (optional, NULL = not available): count registers
+    // from <reg> of register table <table> (= channel - 1) of the module at position
+    // <terminal> into buf. Blocks for about 20 ms per register: never call it from the
+    // cycle thread. KBUS_REG_OK, KBUS_REG_FAILED (request failed, e.g. digital module or
+    // no such table) or KBUS_REG_UNAVAILABLE (no register API in the firmware libraries).
+    int  (*reg_read)(kbus_backend_t *self, uint16_t terminal, uint16_t table, uint16_t reg,
+                     uint16_t count, uint16_t *buf, uint16_t *n);
     void *priv;
 };
 

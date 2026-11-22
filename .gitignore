@@ -6,10 +6,11 @@ build/
 __pycache__/
 
 # WAGO SDK headers: proprietary ("PROPRIETARY RIGHTS ... license agreement").
-# Import them yourself with tools/import-sdk-packages.sh (see sdk/README.md).
+# Import them yourself with tools/import-sdk-packages.sh (see docs/MANUAL.md, 2.2).
 # OsCommon.h is our own minimal stand-in and stays in the repo.
 sdk/include/dal/
 sdk/include/ldkc_kbus_information.h
+sdk/include/ldkc_kbus_register_communication.h
 
 # WAGO documents (download them from wago.com instead)
 docs/reference/**/*.pdf

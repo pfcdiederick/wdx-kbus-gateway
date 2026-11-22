@@ -4,10 +4,9 @@ Every PERIOD_S seconds it
   - reads the digital inputs and outputs and the register ChangeCounter in one request,
   - prints what changed,
   - writes its own registers Example/Heartbeat (+1) and Example/Status in one batch.
-  - reads the text that CODESYS writes (FB_WdxWriteString) into the register
+  - reads the text that a client (e.g. CODESYS) writes into the register
     Codesys/Message, prints it when it changes and answers it with respond():
-    the answer goes into the register Python/Response, which CODESYS reads
-    (FB_WdxReadString).
+    the answer goes into the register Python/Response, where the client reads it.
 It writes no KBUS outputs unless MIRROR_DO is set (e.g. MIRROR_DO=8: DO8 follows DI1).
 Careful: if another program (CODESYS) writes the whole output array, both fight
 over that output.
@@ -25,8 +24,8 @@ the answer register, default 0-0-registers-python-response-value, "" = no answer
 TEXT_POLL_S (how often the text register is checked, default 0.1).
 
 The text register is polled: a text that CODESYS replaces within TEXT_POLL_S is
-not seen. For request/answer, let CODESYS wait for the answer before it writes
-the next text (FB_WdxReadString.xNew).
+not seen. For request/answer, let the client wait for the answer before it writes
+the next text.
 """
 import os
 import signal
@@ -44,7 +43,7 @@ RESPONSE_MAX = 127                        # bytes UTF-8: size of a string regist
 
 def respond(message):
     """Answer to a text from CODESYS. The result is written into the register
-    Python/Response, where CODESYS reads it (FB_WdxReadString).
+    Python/Response, where the client reads it.
     Adapt this function to your application."""
     m = message.strip()
     if not m:

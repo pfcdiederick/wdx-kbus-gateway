@@ -4,7 +4,7 @@
 // Serial/Com1/Transmit is sent as is, what arrives is kept in a receive
 // buffer (Serial/Com1/RxData, RxCount) and split into frames by a pause of
 // FrameGap ms (Serial/Com1/RxFrame, RxFrameCount). The protocol lives in the
-// client (CODESYS: FB_WdaSerial). RS-232 / RS-485 is the mode set in the WBM
+// client (CODESYS). RS-232 / RS-485 is the mode set in the WBM
 // (Interfaces > Serial Interface, owner "None"); the RS-485 direction is
 // switched by the driver.
 //

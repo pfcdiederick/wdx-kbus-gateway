@@ -13,7 +13,7 @@
 #   SKIP_BUILD  1 = install the existing build-ipk/kbus-gateway_<version>_<arch>.ipk
 #
 # Before the first install: only one program may own the KBUS. Set WBM > PLC
-# Runtime to "None", or run the CODESYS runtime without KBUS (README 2.2).
+# Runtime to "None", or run the CODESYS runtime without KBUS (docs/MANUAL.md 2.1).
 set -euo pipefail
 
 PFC=${1:?usage: $0 <pfc-ip>}
@@ -49,4 +49,4 @@ $SSH 'sleep 3; /etc/init.d/kbus-gateway status; P=$(cat /var/run/kbus-gateway.pi
       grep "kbus-gateway\[$P\]" /var/log/messages | tail -12'
 echo ">>> done. Test on the controller:"
 echo "    ssh $PFC_USER@$PFC \"curl -sg --unix-socket /run/kbus-gateway/wdx.sock 'http://x/wda/parameters?page[limit]=5'\""
-echo "    (from the PC, tests/test-rest.py $PFC node, needs HTTP_BIND=0.0.0.0, README 2.7)"
+echo "    (from the PC, tests/test-rest.py $PFC node, needs HTTP_BIND=0.0.0.0, docs/MANUAL.md 2.5)"

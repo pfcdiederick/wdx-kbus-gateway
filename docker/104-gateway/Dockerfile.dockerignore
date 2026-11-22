@@ -1,0 +1,5 @@
+# Ignore file of docker/104-gateway/Dockerfile (build context = docker/).
+*
+!lib/wdx_client.py
+!104-gateway/wdx_2_iec104.py
+!104-gateway/wdx_iec104_config.ini

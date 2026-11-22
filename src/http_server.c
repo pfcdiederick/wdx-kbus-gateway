@@ -122,6 +122,7 @@ static const char *reason_of(int status)
 {
     switch (status) {
     case 200: return "OK";
+    case 201: return "Created";
     case 301: return "Moved Permanently";
     case 204: return "No Content";
     case 400: return "Bad Request";

@@ -8,6 +8,7 @@
 #include "backend.h"
 #include "config.h"
 #include "gateway.h"
+#include "regcom.h"
 #include "http_server.h"
 #include "log.h"
 #include "registers.h"
@@ -59,6 +60,7 @@ int main(void)
         return 1;
     }
 
+    regcom_start(&cfg);                 // register reads (AI status, KBus/ReadRegister)
     registers_load(&cfg);
     serial_start(&cfg);                 // COM1 (SERIAL_DEVICE), transparent forwarding
     const int rc = http_server_run(&cfg, &g_stop);
@@ -66,6 +68,7 @@ int main(void)
     LOG_INFO("shutting down");
     serial_stop();
     registers_save(1);
+    regcom_stop();
     gateway_stop();
     return rc == 0 ? 0 : 1;
 }

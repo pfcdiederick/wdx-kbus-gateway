@@ -1,6 +1,6 @@
 // WAGO ADI/DAL backend.
 //
-// Follows the WAGO examples in docs/reference/HowTo_ADI-MyKBusApplikation:
+// Follows the WAGO example HowTo_ADI-MyKBusApplikation (MIT):
 //   - getkbusinfo.c : module discovery through the KBUS-info D-Bus API
 //   - kbusdemo.c    : KBUS in application state "Running", every cycle is
 //                     triggered with "libpackbus_Push"
@@ -30,7 +30,16 @@ kbus_backend_t *backend_adi_create(const gw_config_t *cfg)
 #include <dal/adi_application_interface.h>
 #include <ldkc_kbus_information.h>
 
-// Defined in <ldkc_kbus_register_communication.h>, which also pulls in glib.
+// Register communication (read only): tools/import-sdk-packages.sh imports this header
+// since version 3.4.0. Without it the gateway builds without register access.
+#if defined(__has_include)
+#if __has_include(<ldkc_kbus_register_communication.h>)
+#include <ldkc_kbus_register_communication.h>
+#define HAVE_KBUS_REGISTERS 1
+#endif
+#endif
+
+// Defined in <ldkc_kbus_register_communication.h>.
 #ifndef LDKC_KBUS_TERMINAL_COUNT_MAX
 #define LDKC_KBUS_TERMINAL_COUNT_MAX (255U)
 #endif
@@ -53,6 +62,13 @@ typedef struct {
     __typeof__(&ldkc_KbusInfo_GetTerminalInfo) info_terminal_info;
     __typeof__(&ldkc_KbusInfo_GetTerminalList) info_terminal_list;
     __typeof__(&ldkc_KbusInfo_Destroy)         info_destroy;
+#ifdef HAVE_KBUS_REGISTERS
+    // optional: register communication (D-Bus to libpackbus, which serves it in this process)
+    __typeof__(&ldkc_KbusRegisterRequest_CreateWorkerThread) reg_worker;
+    __typeof__(&ldkc_KbusRegisterRequest_Read)               reg_read;
+    int reg_worker_started;
+    int reg_warned;
+#endif
 } adi_priv_t;
 
 // Try every colon separated candidate until one loads (RTLD_GLOBAL so that the
@@ -85,7 +101,7 @@ static int resolve_symbols(adi_priv_t *p)
 {
     if (load_first(p->cfg->dal_libs) != 0) {
         LOG_ERROR("could not load the ADI/DAL library. Is the host /usr/lib mounted and"
-                  " LD_LIBRARY_PATH set? (see README, 'Run on the PFC')");
+                  " LD_LIBRARY_PATH set? (see docs/MANUAL.md, section 12)");
         return -1;
     }
     RESOLVE(get_adi, "adi_GetApplicationInterface");
@@ -102,6 +118,13 @@ static int resolve_symbols(adi_priv_t *p)
     RESOLVE(info_terminal_info, "ldkc_KbusInfo_GetTerminalInfo");
     RESOLVE(info_terminal_list, "ldkc_KbusInfo_GetTerminalList");
     RESOLVE(info_destroy,       "ldkc_KbusInfo_Destroy");
+#ifdef HAVE_KBUS_REGISTERS
+    // Optional: without them only the register access is missing.
+    *(void **)(&p->reg_worker) = dlsym(RTLD_DEFAULT, "ldkc_KbusRegisterRequest_CreateWorkerThread");
+    *(void **)(&p->reg_read)   = dlsym(RTLD_DEFAULT, "ldkc_KbusRegisterRequest_Read");
+    if ((p->reg_worker == NULL || p->reg_read == NULL) && !p->reg_warned++)
+        LOG_WARN("register communication not found in the WAGO libraries: no register access");
+#endif
     return 0;
 }
 
@@ -189,7 +212,7 @@ static int adi_open(kbus_backend_t *self, kbus_module_t *modules, size_t max_mod
 
     if (p->adi->OpenDevice(p->dev) != DAL_SUCCESS) {
         LOG_ERROR("opening the KBUS device failed. Only ONE KBUS master is allowed:"
-                  " stop the CODESYS/e!RUNTIME PLC runtime first (see README)");
+                  " stop the CODESYS/e!RUNTIME PLC runtime first (see docs/MANUAL.md, 2.1)");
         return -1;
     }
     p->dev_open = 1;
@@ -325,6 +348,35 @@ static int adi_exchange(kbus_backend_t *self, const uint8_t *out, size_t out_len
     return rc;
 }
 
+// Register read (read only). Must not run while the bus is closed or reopened: gateway.c
+// serialises it with open/close. libpackbus serves the request over D-Bus in its own
+// thread of this process; the library's request worker thread is started once.
+static int adi_reg_read(kbus_backend_t *self, uint16_t terminal, uint16_t table, uint16_t reg,
+                        uint16_t count, uint16_t *buf, uint16_t *n)
+{
+#ifdef HAVE_KBUS_REGISTERS
+    adi_priv_t *p = self->priv;
+    if (p->reg_worker == NULL || p->reg_read == NULL)
+        return KBUS_REG_UNAVAILABLE;
+    if (!p->dev_open)
+        return KBUS_REG_FAILED;
+    if (!p->reg_worker_started) {
+        p->reg_worker();
+        p->reg_worker_started = 1;
+        LOG_INFO("register communication ready (read only)");
+    }
+    tldkc_KbusRegisterRequestData rq = { .Terminal = terminal, .Table = table, .Register = reg, .Length = count };
+    u16 len = 0;
+    if (p->reg_read(&rq, buf, &len) != Request_Ok)
+        return KBUS_REG_FAILED;
+    *n = len < count ? len : count;
+    return KBUS_REG_OK;
+#else
+    (void)self; (void)terminal; (void)table; (void)reg; (void)count; (void)buf; (void)n;
+    return KBUS_REG_UNAVAILABLE;
+#endif
+}
+
 static void adi_close(kbus_backend_t *self)
 {
     adi_priv_t *p = self->priv;
@@ -348,6 +400,7 @@ kbus_backend_t *backend_adi_create(const gw_config_t *cfg)
     backend.open     = adi_open;
     backend.exchange = adi_exchange;
     backend.close    = adi_close;
+    backend.reg_read = adi_reg_read;
     backend.priv     = &priv;
     return &backend;
 }

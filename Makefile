@@ -21,7 +21,7 @@ GW_VERSION := $(shell tr -d ' \n' < VERSION 2>/dev/null)
 GW_CFLAGS  += -DGW_VERSION='"$(GW_VERSION)"'
 GW_LDLIBS  := -ldl
 
-SRCS := src/main.c src/log.c src/config.c src/gateway.c src/http_server.c src/wda.c \
+SRCS := src/main.c src/log.c src/config.c src/gateway.c src/regcom.c src/http_server.c src/wda.c \
         src/registers.c src/serial.c src/backend_sim.c src/backend_adi.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o) $(BUILD)/web_asset.o   # web page built into the binary
 
@@ -35,7 +35,7 @@ ifneq ($(wildcard $(SDK)/include/dal/adi_application_interface.h),)
   ADI_STATE := with WAGO ADI/DAL backend
 else ifeq ($(REQUIRE_ADI),1)
   $(error WAGO SDK headers not found in $(SDK)/include. Run tools/import-sdk-packages.sh \
-          first (README 2.3), or build simulation-only with REQUIRE_ADI=0)
+          first (docs/MANUAL.md 2.2), or build simulation-only with REQUIRE_ADI=0)
 else
   ADI_STATE := SIMULATION ONLY (no sdk/include)
 endif

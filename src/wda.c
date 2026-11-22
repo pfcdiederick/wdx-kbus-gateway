@@ -24,16 +24,37 @@
 //   GET   /wda/parameter-definitions             definitions, paged; filters path, device,
 //                                                beta, deprecated, writeable, userSetting (and id)
 //   GET   /wda/parameter-definitions/{id}        one definition
+//   GET   /wda/methods[/{id}]                    the methods (10)
+//   POST  /wda/methods/{id}/runs                 run a method at once -> 201 with the run (10)
+//           result-behavior sync or auto (default); async -> 400. Runs are not stored:
+//           timeout 0, GET .../runs -> empty list, GET .../runs/{run_id} -> 404
+//     0-0-kbus-exchange (KBus/Exchange)          raw process data of complex modules:
+//           inArgs  Positions uint16[], Outputs uint8[] (concatenated, each module exactly
+//                   its OutputBytes; missing or [] = read only)
+//           outArgs Cycle uint64 (inputs read in this cycle), OutputCycle uint64 (the cycle
+//                   that carried the outputs, 0 = read only), Positions, Inputs uint8[]
+//           all outputs under one lock (same cycle); answer with the inputs of the cycle
+//           after it; 400/39 unknown position, module without raw data, wrong byte count
+//           (nothing written); 500/21 no cycle within 100 ms; 403/57 like a PATCH
+//     0-0-kbus-readregister (KBus/ReadRegister)  read one register (firmware register
+//           communication, regcom.c): inArgs Position, Table 0..255, Register 0..63;
+//           outArgs Value uint16; a failed read: executionStatus error + title, detail,
+//           code (26 read failed / bus not running, 16 no register access)
+//           inArgs as value (JSON numbers) or stringValue ("123"); outArgs only value
 //
 // Errors: {"errors":[{status, title, detail, code, source.pointer}]}, code = WDA status
-// code (manual appendix B): 17 unknown id (404), 24 wrong type, 25 wrong representation,
-// 31 read-only, 36 null, 39 invalid value / out of range (400), 41 not written because
-// another value of the request was rejected, 57 / 58 writes disabled (403),
-// 21 could not set (500). A batch PATCH reports one error object per parameter.
+// code (manual appendix B): 17 unknown id (404), 19 not a method (404), 22 missing
+// argument, 24 wrong type, 25 wrong representation, 31 read-only, 36 null, 39 invalid
+// value / out of range (400), 41 not written because another value of the request was
+// rejected, 57 / 58 writes disabled (403), 21 could not set (500), 15 value not available
+// (500: KBus/AnalogInputs/<n>/Status without a valid status; in a list an "error"
+// attribute of that resource instead, the rest of the list stays valid).
+// A batch PATCH reports one error object per parameter.
 //
 // Not implemented (deliberate, local gateway): HTTPS (426) and authentication, the
-// device, method, enum, instance, monitoring-list, feature and File-API resources.
-// KBus/Rescan and KBus/ResetStatistics are writable parameters, not methods.
+// device, method-definition, enum, instance, monitoring-list, feature and File-API
+// resources, stored or asynchronous runs. KBus/Rescan and KBus/ResetStatistics are
+// writable parameters, not methods.
 //
 // Parameter tree
 //   KBus/Healthy, CycleCount, ErrorCount
@@ -51,17 +72,26 @@
 //                               registers stay free. Switched only through the control
 //                               socket; stored in KBUS_SETTINGS_STORE
 //   KBus/Modules                 instantiations [1..n]
-//   KBus/Modules/{m}/Name, TypeCode, ChannelCount
+//   KBus/Modules/{m}/Name, TypeCode, ChannelCount, Position (= m), InputBytes, OutputBytes
+//   KBus/Modules/{m}/RawInput (R), RawOutput (R/W, exactly OutputBytes)   uint8[]: only
+//                               modules WITHOUT channels with byte-aligned data (750-495,
+//                               -657, -671, -650 ...); the gateway has no driver for them
+//   KBus/ModulePositions, ModuleNames, ModuleTypeCodes, ModuleInputBytes, ModuleOutputBytes
+//                               the module list as arrays (one GET)
 //   KBus/DigitalInputs|DigitalOutputs|AnalogInputs|AnalogOutputs   instantiations
 //   KBus/<Class>/{n}/Value (DO/AO writable), Module, ModuleChannel
 //   KBus/DigitalInputValues|DigitalOutputValues|AnalogInputValues|AnalogOutputValues
 //                                 all values of a class as one array (DO/AO writable)
+//   KBus/AnalogInputs/{n}/Status  status register 6 of the channel (regcom.c, every
+//                                 WDX_AI_STATUS_MS; only modules with AI channels)
+//   KBus/AnalogInputStatusValues, AnalogInputStatusValid   the same for all AI channels
+//   Gateway/Status ("online"), Gateway/Version
 //   Registers/ChangeCounter       +1 for every write that changed a register
 //   Registers/<Name>/Value        declared in REGISTER_FILE (registers.c), writable
 //   Serial/Com1/...               COM1, transparent (serial.c), when SERIAL_DEVICE is set:
 //     Device, Open                the port and whether it is open
-//     Baudrate, Format, FrameGap  settings: written by the dashboard or a client (CODESYS:
-//                                 FB_WdaSerial), stored in KBUS_SETTINGS_STORE
+//     Baudrate, Format, FrameGap  settings: written by a client (CODESYS),
+//                                 stored in KBUS_SETTINGS_STORE
 //     Transmit                    PATCH a string = send these bytes (one character per byte)
 //     TxCount, RxCount            bytes sent / received since the start
 //     RxData                      the last <= 512 received bytes (new = last RxCount-old bytes)
@@ -73,6 +103,7 @@
 #include "wda.h"
 #include "gateway.h"
 #include "log.h"
+#include "regcom.h"
 #include "registers.h"
 #include "serial.h"
 
@@ -94,8 +125,9 @@
 
 // WDA status codes (manual appendix B)
 enum {
-    WC_NONE = 0, WC_INTERNAL = 2, WC_UNKNOWN_PATH = 17, WC_COULD_NOT_SET = 21,
-    WC_WRONG_TYPE = 24, WC_WRONG_REPR = 25, WC_NOT_WRITEABLE = 31, WC_VALUE_NULL = 36,
+    WC_NONE = 0, WC_INTERNAL = 2, WC_VALUE_UNAVAILABLE = 15, WC_NOT_PROVIDED = 16,
+    WC_UNKNOWN_PATH = 17, WC_NOT_A_METHOD = 19, WC_COULD_NOT_SET = 21, WC_MISSING_ARG = 22,
+    WC_WRONG_TYPE = 24, WC_WRONG_REPR = 25, WC_COULD_NOT_INVOKE = 26, WC_NOT_WRITEABLE = 31, WC_VALUE_NULL = 36,
     WC_INVALID_VALUE = 39, WC_OTHER_INVALID = 41, WC_UNAUTHORIZED = 57, WC_OTHER_UNAUTH = 58
 };
 
@@ -189,7 +221,7 @@ static int error(wbuf_t *b, int status, int code, const char *pointer, const cha
 // ---------------------------------------------------------------------------
 // Parameter list
 // ---------------------------------------------------------------------------
-typedef enum { DT_BOOL, DT_UINT16, DT_INT32, DT_UINT32, DT_UINT64, DT_FLOAT64, DT_STRING, DT_INST } dtype_t;
+typedef enum { DT_BOOL, DT_UINT8, DT_UINT16, DT_INT32, DT_UINT32, DT_UINT64, DT_FLOAT64, DT_STRING, DT_INST } dtype_t;
 
 typedef enum {
     P_HEALTHY, P_CYCLETIME, P_CYCLES, P_ERRORS, P_CONFIGVER, P_RESCAN, P_MODULES,
@@ -198,7 +230,12 @@ typedef enum {
     P_REG_CHANGES, P_REG_VALUE,
     P_CYCLEDUR, P_MAXCYCLEDUR, P_MAXLATE, P_OVERRUNS, P_RESETSTATS, P_LOCALCTRL,
     P_SER_DEVICE, P_SER_OPEN, P_SER_BAUD, P_SER_FORMAT, P_SER_GAP, P_SER_TX, P_SER_TXCOUNT,
-    P_SER_RXCOUNT, P_SER_RXDATA, P_SER_FRAME, P_SER_FRAMECOUNT, P_SER_ERRORS
+    P_SER_RXCOUNT, P_SER_RXDATA, P_SER_FRAME, P_SER_FRAMECOUNT, P_SER_ERRORS,
+    // 2.6.0
+    P_GW_STATUS, P_GW_VERSION,
+    P_MODS_POS, P_MODS_NAME, P_MODS_TYPE, P_MODS_INB, P_MODS_OUTB,      // arrays over all modules
+    P_MOD_POS, P_MOD_INB, P_MOD_OUTB, P_MOD_RAWIN, P_MOD_RAWOUT,       // per module
+    P_AI_STVALUES, P_AI_STVALID, P_AI_STATUS                          // status register 6 of the AIs
 } pkind_t;
 
 typedef struct {
@@ -207,7 +244,8 @@ typedef struct {
     uint16_t idx;     // module or channel number (1-based), register index (0-based)
 } param_t;
 
-#define MAX_PARAMS (26 + KBUS_MAX_MODULES * 3 + IO_KIND_COUNT * (2 + GW_MAX_CHANNELS * 3) + 1 + REG_MAX)
+#define MAX_PARAMS (40 + KBUS_MAX_MODULES * 8 + IO_KIND_COUNT * (2 + GW_MAX_CHANNELS * 3) + 2 + GW_MAX_CHANNELS \
+                    + 1 + REG_MAX)
 
 #define ID_MAX 64                    // longest: 0-0-registers-<40 characters>-value
 
@@ -259,10 +297,22 @@ static void build_list(void)
     add(P_RESETSTATS, 0, 0);
     add(P_LOCALCTRL, 0, 0);
     add(P_MODULES, 0, 0);
+    for (int k = P_MODS_POS; k <= P_MODS_OUTB; ++k)
+        add((pkind_t)k, 0, 0);
     for (size_t m = 1; m <= nmod; ++m) {
         add(P_MOD_NAME, 0, m);
         add(P_MOD_TYPE, 0, m);
         add(P_MOD_CHCOUNT, 0, m);
+        add(P_MOD_POS, 0, m);
+        add(P_MOD_INB, 0, m);
+        add(P_MOD_OUTB, 0, m);
+        size_t ni = 0, no = 0;
+        if (gateway_module_raw(m - 1, &ni, &no)) {         // complex module without channels
+            if (ni)
+                add(P_MOD_RAWIN, 0, m);
+            if (no)
+                add(P_MOD_RAWOUT, 0, m);
+        }
     }
     for (int k = 0; k < IO_KIND_COUNT; ++k) {
         add(P_CLS_INST, (io_kind_t)k, 0);
@@ -270,8 +320,14 @@ static void build_list(void)
             add(P_CH_VALUE, (io_kind_t)k, c);
             add(P_CH_MODULE, (io_kind_t)k, c);
             add(P_CH_MODCH, (io_kind_t)k, c);
+            if (k == IO_AI)
+                add(P_AI_STATUS, IO_AI, c);
         }
         add(P_CLS_VALUES, (io_kind_t)k, 0);
+        if (k == IO_AI) {
+            add(P_AI_STVALUES, IO_AI, 0);
+            add(P_AI_STVALID, IO_AI, 0);
+        }
     }
     add(P_REG_CHANGES, 0, 0);
     for (size_t r = 0; r < registers_count(); ++r)
@@ -279,6 +335,8 @@ static void build_list(void)
     if (serial_enabled())
         for (int k = P_SER_DEVICE; k <= P_SER_ERRORS; ++k)
             add((pkind_t)k, 0, 0);
+    add(P_GW_STATUS, 0, 0);
+    add(P_GW_VERSION, 0, 0);
 }
 
 static void id_of(const param_t *p, char *buf, size_t len);
@@ -331,6 +389,21 @@ static void path_of(const param_t *p, char *buf, size_t len)
     case P_SER_FRAME:      snprintf(buf, len, "Serial/Com1/RxFrame"); break;
     case P_SER_FRAMECOUNT: snprintf(buf, len, "Serial/Com1/RxFrameCount"); break;
     case P_SER_ERRORS:     snprintf(buf, len, "Serial/Com1/Errors"); break;
+    case P_GW_STATUS:   snprintf(buf, len, "Gateway/Status"); break;
+    case P_GW_VERSION:  snprintf(buf, len, "Gateway/Version"); break;
+    case P_MODS_POS:    snprintf(buf, len, "KBus/ModulePositions"); break;
+    case P_MODS_NAME:   snprintf(buf, len, "KBus/ModuleNames"); break;
+    case P_MODS_TYPE:   snprintf(buf, len, "KBus/ModuleTypeCodes"); break;
+    case P_MODS_INB:    snprintf(buf, len, "KBus/ModuleInputBytes"); break;
+    case P_MODS_OUTB:   snprintf(buf, len, "KBus/ModuleOutputBytes"); break;
+    case P_MOD_POS:     snprintf(buf, len, "KBus/Modules/%u/Position", p->idx); break;
+    case P_MOD_INB:     snprintf(buf, len, "KBus/Modules/%u/InputBytes", p->idx); break;
+    case P_MOD_OUTB:    snprintf(buf, len, "KBus/Modules/%u/OutputBytes", p->idx); break;
+    case P_MOD_RAWIN:   snprintf(buf, len, "KBus/Modules/%u/RawInput", p->idx); break;
+    case P_MOD_RAWOUT:  snprintf(buf, len, "KBus/Modules/%u/RawOutput", p->idx); break;
+    case P_AI_STVALUES: snprintf(buf, len, "KBus/AnalogInputStatusValues"); break;
+    case P_AI_STVALID:  snprintf(buf, len, "KBus/AnalogInputStatusValid"); break;
+    case P_AI_STATUS:   snprintf(buf, len, "KBus/AnalogInputs/%u/Status", p->idx); break;
     }
 }
 
@@ -371,7 +444,13 @@ static dtype_t dtype_of(const param_t *p)
         return DT_STRING;
     case P_MODULES:
     case P_CLS_INST:  return DT_INST;
-    case P_MOD_NAME:  return DT_STRING;
+    case P_MOD_NAME:
+    case P_MODS_NAME:
+    case P_GW_STATUS:
+    case P_GW_VERSION: return DT_STRING;
+    case P_MOD_RAWIN:
+    case P_MOD_RAWOUT: return DT_UINT8;
+    case P_AI_STVALID: return DT_BOOL;
     case P_SER_OPEN:  return DT_BOOL;
     case P_SER_BAUD:  return DT_UINT32;
     case P_SER_DEVICE:
@@ -392,10 +471,14 @@ static dtype_t dtype_of(const param_t *p)
 // Types with a string representation (manual chapter 6, Data types).
 static int is_numeric(dtype_t t)
 {
-    return t == DT_UINT16 || t == DT_INT32 || t == DT_UINT32 || t == DT_UINT64 || t == DT_FLOAT64;
+    return t == DT_UINT8 || t == DT_UINT16 || t == DT_INT32 || t == DT_UINT32 || t == DT_UINT64 || t == DT_FLOAT64;
 }
 
-static int is_array(const param_t *p)  { return p->kind == P_CLS_VALUES; }
+static int is_array(const param_t *p)
+{
+    return p->kind == P_CLS_VALUES || (p->kind >= P_MODS_POS && p->kind <= P_MODS_OUTB) ||
+           p->kind == P_MOD_RAWIN || p->kind == P_MOD_RAWOUT || p->kind == P_AI_STVALUES || p->kind == P_AI_STVALID;
+}
 static int is_serial(const param_t *p) { return p->kind >= P_SER_DEVICE && p->kind <= P_SER_ERRORS; }
 static int is_serial_setting(const param_t *p)
 {
@@ -404,7 +487,7 @@ static int is_serial_setting(const param_t *p)
 static int writeable(const param_t *p)
 {
     if (p->kind == P_RESCAN || p->kind == P_RESETSTATS || p->kind == P_CYCLETIME || p->kind == P_REG_VALUE ||
-        p->kind == P_LOCALCTRL || is_serial_setting(p) || p->kind == P_SER_TX)
+        p->kind == P_LOCALCTRL || is_serial_setting(p) || p->kind == P_SER_TX || p->kind == P_MOD_RAWOUT)
         return 1;
     return (p->kind == P_CH_VALUE || p->kind == P_CLS_VALUES) && io_kind_writable((io_kind_t)p->cls);
 }
@@ -421,6 +504,7 @@ static const char *dtype_name(dtype_t t)
 {
     switch (t) {
     case DT_BOOL:   return "boolean";
+    case DT_UINT8:  return "uint8";
     case DT_UINT16: return "uint16";
     case DT_INT32:  return "int32";
     case DT_UINT32: return "uint32";
@@ -452,6 +536,8 @@ typedef struct {
     uint64_t    reg_changes;
     reg_value_t reg[REG_MAX];
     serial_snapshot_t ser;
+    uint8_t     ai_state[GW_MAX_CHANNELS];     // regcom: REGCOM_PENDING / VALID / UNSUPPORTED
+    uint16_t    ai_status[GW_MAX_CHANNELS];
 } values_t;
 
 static values_t *values_take(void)
@@ -463,6 +549,7 @@ static values_t *values_take(void)
     gateway_stats(&v->stats);
     registers_snapshot(v->reg, &v->reg_changes);
     serial_snapshot(&v->ser);
+    regcom_status(v->ai_state, v->ai_status, GW_MAX_CHANNELS);
     return v;
 }
 
@@ -566,7 +653,87 @@ static void write_value(wbuf_t *b, const param_t *p, const values_t *v)
         wb_printf(b, "%s", json);
         break;
     }
+    case P_GW_STATUS:  wb_printf(b, "\"online\""); break;     // answering = online
+    case P_GW_VERSION: wb_json_string(b, GW_VERSION); break;
+    case P_MODS_POS:
+    case P_MODS_NAME:
+    case P_MODS_TYPE:
+    case P_MODS_INB:
+    case P_MODS_OUTB:
+        wb_printf(b, "[");
+        for (size_t m = 0; m < nmod; ++m) {
+            if (m)
+                wb_printf(b, ",");
+            if (p->kind == P_MODS_NAME) {
+                char name[48];
+                gateway_module_name(&mods[m], name, sizeof(name));
+                wb_json_string(b, name);
+            } else {
+                wb_printf(b, "%u", p->kind == P_MODS_POS  ? mods[m].position
+                                 : p->kind == P_MODS_TYPE ? mods[m].type
+                                 : p->kind == P_MODS_INB  ? (mods[m].in_size_bits + 7u) / 8u
+                                                          : (mods[m].out_size_bits + 7u) / 8u);
+            }
+        }
+        wb_printf(b, "]");
+        break;
+    case P_MOD_POS:
+    case P_MOD_INB:
+    case P_MOD_OUTB: {
+        unsigned x = 0;
+        if (p->idx >= 1 && p->idx <= nmod) {
+            const kbus_module_t *m = &mods[p->idx - 1];
+            x = p->kind == P_MOD_POS ? m->position
+              : p->kind == P_MOD_INB ? (m->in_size_bits + 7u) / 8u : (m->out_size_bits + 7u) / 8u;
+        }
+        wb_printf(b, "%u", x);
+        break;
     }
+    case P_MOD_RAWIN:
+    case P_MOD_RAWOUT: {
+        uint8_t raw[GW_MODULE_RAW_MAX];
+        const size_t n = p->kind == P_MOD_RAWIN ? gateway_module_input(p->idx - 1u, raw, sizeof(raw))
+                                                : gateway_module_output_read(p->idx - 1u, raw, sizeof(raw));
+        wb_printf(b, "[");
+        for (size_t i = 0; i < n; ++i)
+            wb_printf(b, i ? ",%u" : "%u", raw[i]);
+        wb_printf(b, "]");
+        break;
+    }
+    case P_AI_STVALUES:
+    case P_AI_STVALID:
+        wb_printf(b, "[");
+        for (size_t c = 0; c < gateway_channel_count(IO_AI); ++c) {
+            if (c)
+                wb_printf(b, ",");
+            const int ok = v->ai_state[c] == REGCOM_VALID;
+            if (p->kind == P_AI_STVALID)
+                wb_printf(b, ok ? "true" : "false");
+            else
+                wb_printf(b, "%u", ok ? v->ai_status[c] : 0u);
+        }
+        wb_printf(b, "]");
+        break;
+    case P_AI_STATUS:
+        if (v->ai_state[p->idx - 1] == REGCOM_VALID)
+            wb_printf(b, "%u", v->ai_status[p->idx - 1]);
+        else
+            wb_printf(b, "null");             // only in GET /events; a GET reports code 15
+        break;
+    }
+}
+
+// KBus/AnalogInputs/<n>/Status without a valid value (not read yet, or no register access)
+static int value_unavailable(const param_t *p, const values_t *v)
+{
+    return p->kind == P_AI_STATUS && v->ai_state[p->idx - 1] != REGCOM_VALID;
+}
+
+static const char *unavailable_detail(const param_t *p, const values_t *v)
+{
+    (void)p;
+    return v->ai_state[p->idx - 1] == REGCOM_PENDING ? "status register 6 not read yet"
+                                                    : "no status: the module has no register access, or WDX_AI_STATUS_MS=0";
 }
 
 // stringValue of a numeric value that was just written to b[vs..ve): the same
@@ -602,8 +769,17 @@ static void write_resource(wbuf_t *b, const param_t *p, const values_t *v)
     path_of(p, path, sizeof(path));
     const dtype_t t = dtype_of(p);
     wb_printf(b, "{\"type\":\"parameters\",\"id\":\"%s\",\"attributes\":{\"path\":\"%s\","
-                 "\"dataType\":\"%s\",\"dataRank\":\"%s\",\"value\":",
+                 "\"dataType\":\"%s\",\"dataRank\":\"%s\",",
               pids[index_of(p)], path, dtype_name(t), is_array(p) ? "array" : "scalar");
+    if (value_unavailable(p, v)) {
+        // in a collection: the WDA alternative error handling (error attribute of this
+        // resource, manual chapter 6) so that one missing status does not fail the list
+        wb_printf(b, "\"error\":");
+        error_object(b, 500, WC_VALUE_UNAVAILABLE, NULL, unavailable_detail(p, v));
+        wb_printf(b, "}}");
+        return;
+    }
+    wb_printf(b, "\"value\":");
     const size_t vs = b->len;
     write_value(b, p, v);
     const size_t ve = b->len;
@@ -1076,7 +1252,8 @@ static int do_service_identity(wbuf_t *b)
                  "\"serviceName\":\"kbus-gateway\",\"serviceVersion\":\"%s\",\"apiVersion\":\"%s\","
                  "\"coreVersion\":\"%s\"},\"relationships\":{"
                  "\"parameters\":{\"links\":{\"related\":\"/wda/parameters\"}},"
-                 "\"parameter-definitions\":{\"links\":{\"related\":\"/wda/parameter-definitions\"}}}}}",
+                 "\"parameter-definitions\":{\"links\":{\"related\":\"/wda/parameter-definitions\"}},"
+                 "\"methods\":{\"links\":{\"related\":\"/wda/methods\"}}}}}",
               GW_VERSION, WDA_API_VERSION, GW_VERSION);
     return 200;
 }
@@ -1111,6 +1288,10 @@ typedef struct {
     int         ser_tx_set;
     char        sv[REQ_MAX];                               // values converted from stringValue
     size_t      svn;
+    uint8_t     raw_set[KBUS_MAX_MODULES];                 // KBus/Modules/<m>/RawOutput staged
+    uint8_t     raw[KBUS_MAX_MODULES][GW_MODULE_RAW_MAX];
+    uint8_t     raw_len[KBUS_MAX_MODULES];
+    int         raw_any;
 } batch_t;
 
 static batch_t *batch_new(void)
@@ -1131,6 +1312,8 @@ static batch_t *batch_new(void)
     bt->ser_fmt[0] = '\0';
     bt->ser_tx_len = 0;
     bt->ser_tx_set = 0;
+    memset(bt->raw_set, 0, sizeof(bt->raw_set));
+    bt->raw_any = 0;
     return bt;
 }
 
@@ -1196,6 +1379,53 @@ static int from_string_value(batch_t *bt, const param_t *p, const char *s, size_
     *v = out;
     *vl = o;
     bt->svn += o;
+    return 0;
+}
+
+// A JSON array of integers 0..max (strings = 1: of numbers in double quotes, the
+// stringValue form). Returns 0 or a WDA status code; *n = number of values.
+static int parse_uint_array(const char *v, size_t vl, int strings, uint32_t max, uint32_t *out, size_t cap, size_t *n)
+{
+    jr_t j = { v, vl, 0 };
+    *n = 0;
+    jr_ws(&j);
+    if (span_eq(v + j.i, vl - j.i, "null"))
+        return WC_VALUE_NULL;
+    if (j.i >= j.n || j.s[j.i] != '[')
+        return WC_WRONG_TYPE;
+    j.i++;
+    jr_ws(&j);
+    if (j.i < j.n && j.s[j.i] == ']')
+        return 0;
+    for (;;) {
+        jr_ws(&j);
+        const char *e; size_t el;
+        if (strings) {
+            if (jr_string(&j, &e, &el) != 0)
+                return WC_WRONG_REPR;
+        } else {
+            const size_t st = j.i;
+            if (j.i < j.n && j.s[j.i] == '"')
+                return WC_WRONG_TYPE;
+            if (jr_skip(&j, 0) != 0)
+                return WC_WRONG_TYPE;
+            e = v + st;
+            el = j.i - st;
+        }
+        int32_t x;
+        const int c = parse_scalar(e, el, 0, &x);
+        if (c == WC_VALUE_NULL || c == WC_WRONG_TYPE)
+            return strings ? WC_WRONG_REPR : c;
+        if (c || (uint32_t)x > max)
+            return WC_INVALID_VALUE;
+        if (*n >= cap)
+            return WC_INVALID_VALUE;
+        out[(*n)++] = (uint32_t)x;
+        jr_ws(&j);
+        if (j.i < j.n && j.s[j.i] == ',') { j.i++; continue; }
+        if (j.i < j.n && j.s[j.i] == ']') break;
+        return WC_WRONG_TYPE;
+    }
     return 0;
 }
 
@@ -1291,6 +1521,29 @@ static int stage(batch_t *bt, const gw_config_t *cfg, int control, const param_t
         memcpy(bt->kb[k], tmp, n * sizeof(tmp[0]));       // only a valid array is staged
         if (bt->kbn[k] < n)
             bt->kbn[k] = n;
+        break;
+    }
+    case P_MOD_RAWOUT: {                                  // raw output bytes of one module
+        size_t no = 0, n = 0;
+        uint32_t tmp[GW_MODULE_RAW_MAX + 1];
+        const size_t mi = p->idx - 1u;
+        if (!gateway_module_raw(mi, NULL, &no) || no == 0)
+            return verr(e, 400, WC_NOT_WRITEABLE, p, "module has no raw output data");
+        const int c = parse_uint_array(v, vl, 0, 255, tmp, GW_MODULE_RAW_MAX + 1, &n);
+        char msg[80];
+        if (c) {
+            snprintf(msg, sizeof(msg), "value must be an array of %zu integers 0..255", no);
+            return verr(e, 400, c, p, msg);
+        }
+        if (n != no) {
+            snprintf(msg, sizeof(msg), "value must have exactly %zu bytes (OutputBytes), not %zu", no, n);
+            return verr(e, 400, WC_INVALID_VALUE, p, msg);
+        }
+        for (size_t i = 0; i < n; ++i)
+            bt->raw[mi][i] = (uint8_t)tmp[i];
+        bt->raw_len[mi] = (uint8_t)n;
+        bt->raw_set[mi] = 1;
+        bt->raw_any = 1;
         break;
     }
     case P_SER_BAUD: {
@@ -1390,6 +1643,11 @@ static int commit(batch_t *bt, const gw_config_t *cfg, int control, wbuf_t *b)
         if (gateway_write_multi(all, bt->kbn, &kchanged) != GW_OK)
             return error(b, 500, WC_COULD_NOT_SET, NULL, "the KBUS outputs could not be set");
     }
+    for (size_t mi = 0; bt->raw_any && mi < KBUS_MAX_MODULES; ++mi)
+        if (bt->raw_set[mi] && gateway_module_output(mi, bt->raw[mi], bt->raw_len[mi]) != GW_OK)
+            return error(b, 500, WC_COULD_NOT_SET, NULL, "the raw output bytes could not be set");
+    if (bt->raw_any)
+        kchanged = 1;                                     // logged like the other KBUS writes
     if (bt->rn)
         registers_write(bt->ridx, bt->rval, bt->rn, NULL);
     if (bt->ser_baud || bt->ser_fmt[0] || bt->ser_gap) {     // COM1 settings first, then send
@@ -1641,6 +1899,7 @@ void wda_init(void)
     build_list();
     build_ids();
     built_version = v;
+    regcom_layout();                     // AI channels for the status reads
 }
 
 static int do_get_one(const param_t *p, wbuf_t *b)
@@ -1648,6 +1907,13 @@ static int do_get_one(const param_t *p, wbuf_t *b)
     values_t *v = values_take();
     if (v == NULL)
         return error(b, 500, WC_INTERNAL, NULL, "out of memory");
+    if (value_unavailable(p, v)) {
+        char detail[256], path[96];
+        path_of(p, path, sizeof(path));
+        snprintf(detail, sizeof(detail), "%s: %s", path, unavailable_detail(p, v));
+        free(v);
+        return error(b, 500, WC_VALUE_UNAVAILABLE, NULL, detail);
+    }
     wb_printf(b, "{\"data\":");
     write_resource(b, p, v);
     wb_printf(b, "}");
@@ -1668,13 +1934,334 @@ static int starts(const char *s, size_t n, const char *lit)
     return n >= l && memcmp(s, lit, l) == 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// Methods (manual chapter 10): POST /wda/methods/{id}/runs runs a method at once
+// (result-behavior sync); the run is answered with 201 and is not stored (timeout 0).
+//   KBus/Exchange      raw process data of complex modules: write and read in one request
+//   KBus/ReadRegister  read one register of a module (firmware register communication)
+// ---------------------------------------------------------------------------
+#define EXCHANGE_TIMEOUT_MS 100
+
+typedef struct { const char *id, *path; } method_t;
+static const method_t methods[] = {
+    { "0-0-kbus-exchange",     "KBus/Exchange" },
+    { "0-0-kbus-readregister", "KBus/ReadRegister" },
+};
+#define METHOD_COUNT (sizeof(methods) / sizeof(methods[0]))
+
+static uint64_t run_counter;                 // run ids (__atomic: several threads)
+
+static const method_t *find_method(const char *id, size_t len)
+{
+    for (size_t i = 0; i < METHOD_COUNT; ++i)
+        if (span_eq(id, len, methods[i].id))
+            return &methods[i];
+    return NULL;
+}
+
+static void write_method(wbuf_t *b, const method_t *m)
+{
+    wb_printf(b, "{\"type\":\"methods\",\"id\":\"%s\",\"attributes\":{\"path\":\"%s\"},"
+                 "\"relationships\":{\"runs\":{\"links\":{\"related\":\"/wda/methods/%s/runs\"}}}}",
+              m->id, m->path, m->id);
+}
+
+// The span of inArgs.<name>: its "value", or its "stringValue" (*strings = 1).
+// 0 = found, -1 = argument missing, -2 = argument without value/stringValue.
+static int in_arg(const char *body, size_t blen, const char *name, const char **v, size_t *vl, int *strings)
+{
+    const char *kv[] = { "data", "attributes", "inArgs", name, "value" };
+    const char *ks[] = { "data", "attributes", "inArgs", name, "stringValue" };
+    const char *ka[] = { "data", "attributes", "inArgs", name };
+    *strings = 0;
+    if (jr_get(body, blen, kv, 5, v, vl) == 0)
+        return 0;
+    if (jr_get(body, blen, ks, 5, v, vl) == 0) {
+        *strings = 1;
+        return 0;
+    }
+    return jr_get(body, blen, ka, 4, v, vl) == 0 ? -2 : -1;
+}
+
+// One unsigned scalar argument 0..max (value: a number; stringValue: "123").
+static int arg_uint(const char *body, size_t blen, const char *name, uint32_t max, uint32_t *out, wbuf_t *b)
+{
+    const char *v; size_t vl; int str;
+    char detail[128], ptr[64];
+    snprintf(ptr, sizeof(ptr), "/data/attributes/inArgs/%s", name);
+    const int r = in_arg(body, blen, name, &v, &vl, &str);
+    if (r == -1) {
+        snprintf(detail, sizeof(detail), "inArgs.%s missing", name);
+        return error(b, 400, WC_MISSING_ARG, ptr, detail);
+    }
+    if (r == -2) {
+        snprintf(detail, sizeof(detail), "inArgs.%s needs value or stringValue", name);
+        return error(b, 400, WC_MISSING_ARG, ptr, detail);
+    }
+    if (str) {
+        const char *s2; size_t sl;
+        jr_t j = { v, vl, 0 };
+        if (jr_string(&j, &s2, &sl) != 0) {
+            snprintf(detail, sizeof(detail), "inArgs.%s.stringValue must be a number in double quotes", name);
+            return error(b, 400, WC_WRONG_REPR, ptr, detail);
+        }
+        v = s2;
+        vl = sl;
+    }
+    int32_t x;
+    const int c = parse_scalar(v, vl, 0, &x);
+    if (c == WC_VALUE_NULL || c == WC_WRONG_TYPE) {
+        snprintf(detail, sizeof(detail), "inArgs.%s must be an integer 0..%u", name, (unsigned)max);
+        return error(b, 400, str ? WC_WRONG_REPR : c, ptr, detail);
+    }
+    if (c || (uint32_t)x > max) {
+        snprintf(detail, sizeof(detail), "inArgs.%s out of range 0..%u", name, (unsigned)max);
+        return error(b, 400, WC_INVALID_VALUE, ptr, detail);
+    }
+    *out = (uint32_t)x;
+    return 0;
+}
+
+static int run_head(wbuf_t *b, const method_t *m, const char *status)
+{
+    const uint64_t k = __atomic_add_fetch(&run_counter, 1, __ATOMIC_RELAXED);
+    b->len = 0;
+    wb_printf(b, "{\"data\":{\"type\":\"runs\",\"id\":\"%s-%llu\",\"attributes\":{\"executionStatus\":\"%s\","
+                 "\"timeout\":0", m->id, (unsigned long long)k, status);
+    return 0;
+}
+
+static void write_u8_list(wbuf_t *b, const uint8_t *x, size_t n)
+{
+    wb_printf(b, "[");
+    for (size_t i = 0; i < n; ++i)
+        wb_printf(b, i ? ",%u" : "%u", x[i]);
+    wb_printf(b, "]");
+}
+
+// KBus/Exchange: inArgs Positions (uint16[]), Outputs (uint8[], empty / missing = read only)
+static int run_exchange(const method_t *m, const char *body, size_t blen, const gw_config_t *cfg, int control,
+                        wbuf_t *b)
+{
+    uint32_t pos[KBUS_MAX_MODULES + 1];
+    size_t npos = 0, nout = 0;
+    const char *v; size_t vl; int str;
+    int r = in_arg(body, blen, "Positions", &v, &vl, &str);
+    if (r < 0)
+        return error(b, 400, WC_MISSING_ARG, "/data/attributes/inArgs/Positions",
+                     "inArgs.Positions missing (array of module positions)");
+    int c = parse_uint_array(v, vl, str, 65535, pos, KBUS_MAX_MODULES + 1, &npos);
+    if (c)
+        return error(b, 400, c, "/data/attributes/inArgs/Positions",
+                     c == WC_INVALID_VALUE ? "inArgs.Positions: at most 64 positions 0..65535"
+                                           : "inArgs.Positions must be an array of module positions");
+    if (npos == 0)
+        return error(b, 400, WC_INVALID_VALUE, "/data/attributes/inArgs/Positions", "inArgs.Positions is empty");
+
+    uint32_t *out = malloc((KBUS_MAX_MODULES * GW_MODULE_RAW_MAX + 1) * sizeof(*out));
+    uint8_t *ob = malloc(KBUS_MAX_MODULES * GW_MODULE_RAW_MAX);
+    uint8_t *ib = malloc(KBUS_MAX_MODULES * GW_MODULE_RAW_MAX);
+    if (out == NULL || ob == NULL || ib == NULL) {
+        free(out); free(ob); free(ib);
+        return error(b, 500, WC_INTERNAL, NULL, "out of memory");
+    }
+    int st = 0;
+    r = in_arg(body, blen, "Outputs", &v, &vl, &str);
+    if (r == 0) {
+        c = parse_uint_array(v, vl, str, 255, out, KBUS_MAX_MODULES * GW_MODULE_RAW_MAX + 1, &nout);
+        if (c)
+            st = error(b, 400, c, "/data/attributes/inArgs/Outputs", "inArgs.Outputs must be an array of bytes 0..255");
+    }
+    size_t mi[KBUS_MAX_MODULES], need_out = 0;
+    char detail[160];
+    for (size_t i = 0; st == 0 && i < npos; ++i) {
+        const int x = gateway_module_index((uint16_t)pos[i]);
+        size_t ni = 0, no = 0;
+        if (x < 0 || pos[i] > 65535) {
+            snprintf(detail, sizeof(detail), "inArgs.Positions[%zu]: no module at position %u", i, (unsigned)pos[i]);
+            st = error(b, 400, WC_INVALID_VALUE, "/data/attributes/inArgs/Positions", detail);
+        } else if (!gateway_module_raw((size_t)x, &ni, &no)) {
+            snprintf(detail, sizeof(detail), "inArgs.Positions[%zu]: module %u has no raw process data "
+                     "(a module with channels, or data not byte aligned)", i, (unsigned)pos[i]);
+            st = error(b, 400, WC_INVALID_VALUE, "/data/attributes/inArgs/Positions", detail);
+        } else {
+            for (size_t k = 0; k < i; ++k)
+                if (mi[k] == (size_t)x) {
+                    snprintf(detail, sizeof(detail), "inArgs.Positions[%zu]: position %u twice", i, (unsigned)pos[i]);
+                    st = error(b, 400, WC_INVALID_VALUE, "/data/attributes/inArgs/Positions", detail);
+                }
+            mi[i] = (size_t)x;
+            need_out += no;
+        }
+    }
+    if (st == 0 && nout != 0 && nout != need_out) {
+        snprintf(detail, sizeof(detail), "inArgs.Outputs has %zu bytes; the modules need %zu (the sum of their "
+                 "OutputBytes), or none to only read", nout, need_out);
+        st = error(b, 400, WC_INVALID_VALUE, "/data/attributes/inArgs/Outputs", detail);
+    }
+    if (st == 0 && nout != 0) {                           // a KBUS write: the same rules as a PATCH
+        if (!control && __atomic_load_n(&local_control, __ATOMIC_RELAXED))
+            st = error(b, 403, WC_UNAUTHORIZED, "/data/attributes/inArgs/Outputs",
+                       "local control: only the dashboard may write the KBUS");
+        else if (!cfg->http_write_enable)
+            st = error(b, 403, WC_UNAUTHORIZED, "/data/attributes/inArgs/Outputs",
+                       "KBUS writes are disabled (HTTP_WRITE_ENABLE=0)");
+    }
+    size_t nin = 0;
+    uint64_t cycle = 0, ocycle = 0;
+    if (st == 0) {
+        for (size_t i = 0; i < nout; ++i)
+            ob[i] = (uint8_t)out[i];
+        r = gateway_exchange(mi, npos, ob, nout, ib, KBUS_MAX_MODULES * GW_MODULE_RAW_MAX, &nin, &cycle, &ocycle,
+                             EXCHANGE_TIMEOUT_MS);
+        if (r == GW_ETIMEOUT)
+            st = error(b, 500, WC_COULD_NOT_SET, NULL, nout
+                       ? "no completed KBUS cycle within 100 ms (bus error or rescan); the outputs may have been written"
+                       : "no completed KBUS cycle within 100 ms (bus error or rescan)");
+        else if (r != GW_OK)
+            st = error(b, 400, WC_INVALID_VALUE, NULL, "modules changed (rescan); read KBus/ModulePositions again");
+    }
+    if (st == 0) {
+        if (nout && cfg->http_log >= 2)
+            LOG_INFO("exchange: %zu module(s), %zu output bytes, output cycle %llu", npos, nout,
+                     (unsigned long long)ocycle);
+        run_head(b, m, "done");
+        wb_printf(b, ",\"outArgs\":{\"Cycle\":{\"value\":%llu},\"OutputCycle\":{\"value\":%llu},\"Positions\":{\"value\":[",
+                  (unsigned long long)cycle, (unsigned long long)ocycle);
+        for (size_t i = 0; i < npos; ++i)
+            wb_printf(b, i ? ",%u" : "%u", (unsigned)pos[i]);
+        wb_printf(b, "]},\"Inputs\":{\"value\":");
+        write_u8_list(b, ib, nin);
+        wb_printf(b, "}}}}}");
+        st = 201;
+    }
+    free(out); free(ob); free(ib);
+    return st;
+}
+
+// KBus/ReadRegister: inArgs Position, Table (0..255), Register (0..63); outArgs Value
+static int run_readregister(const method_t *m, const char *body, size_t blen, wbuf_t *b)
+{
+    uint32_t pos, table, reg;
+    int st;
+    if ((st = arg_uint(body, blen, "Position", 65535, &pos, b)) != 0 ||
+        (st = arg_uint(body, blen, "Table", 255, &table, b)) != 0 ||
+        (st = arg_uint(body, blen, "Register", 63, &reg, b)) != 0)
+        return st;
+    if (gateway_module_index((uint16_t)pos) < 0) {
+        char detail[80];
+        snprintf(detail, sizeof(detail), "inArgs.Position: no module at position %u", (unsigned)pos);
+        return error(b, 400, WC_INVALID_VALUE, "/data/attributes/inArgs/Position", detail);
+    }
+    uint16_t value = 0;
+    const char *why = NULL;
+    const int r = regcom_read((uint16_t)pos, (uint16_t)table, (uint16_t)reg, &value, &why);
+    if (r == -100)
+        return error(b, 500, WC_COULD_NOT_INVOKE, NULL, why);
+    run_head(b, m, r == GW_OK ? "done" : "error");
+    if (r == GW_OK) {
+        wb_printf(b, ",\"outArgs\":{\"Value\":{\"value\":%u}}}}}", value);
+    } else {
+        // the method ran and failed: 201 with executionStatus error (manual chapter 10)
+        char detail[160];
+        snprintf(detail, sizeof(detail), "module %u, table %u, register %u: %s", (unsigned)pos, (unsigned)table,
+                 (unsigned)reg, why ? why : "error");
+        const int code = (r == GW_EUNAVAILABLE || r == -101) ? WC_NOT_PROVIDED : WC_COULD_NOT_INVOKE;
+        wb_printf(b, ",\"title\":\"register read failed\",\"detail\":");
+        wb_json_string(b, detail);
+        wb_printf(b, ",\"code\":\"%d\"}}}", code);
+    }
+    return 201;
+}
+
+// /wda/methods[/{id}[/runs[/{run_id}]]]
+static int do_methods(const char *method, const char *req, size_t len, const char *path, size_t plen,
+                      const char *query, size_t qlen, const gw_config_t *cfg, int control, wbuf_t *b)
+{
+    static const char base[] = "/wda/methods";
+    const size_t bl = sizeof(base) - 1;
+    const int post = method[0] == 'P' && method[1] == 'O';
+    if (plen == bl) {                                     // the list
+        if (post || method[0] != 'G')
+            return error(b, 405, WC_NONE, NULL, "use GET on /wda/methods");
+        wb_printf(b, "{\"data\":[");
+        for (size_t i = 0; i < METHOD_COUNT; ++i) {
+            if (i)
+                wb_printf(b, ",");
+            write_method(b, &methods[i]);
+        }
+        wb_printf(b, "],\"meta\":{\"total\":%zu,\"offset\":0,\"count\":%zu}}", METHOD_COUNT, METHOD_COUNT);
+        return 200;
+    }
+    const char *id = path + bl + 1;
+    size_t idlen = plen - bl - 1;
+    const char *slash = memchr(id, '/', idlen);
+    const char *rest = slash ? slash + 1 : id + idlen;
+    const size_t rl = slash ? (size_t)(id + idlen - rest) : 0;
+    if (slash)
+        idlen = (size_t)(slash - id);
+    const method_t *m = find_method(id, idlen);
+    if (m == NULL) {
+        char detail[ID_MAX + 40];
+        snprintf(detail, sizeof(detail), "unknown method id %.*s", (int)(idlen > ID_MAX ? ID_MAX : idlen), id);
+        return error(b, 404, find_id(id, idlen) ? WC_NOT_A_METHOD : WC_UNKNOWN_PATH, NULL, detail);
+    }
+    if (!slash) {                                         // one method
+        if (method[0] != 'G' || post)
+            return error(b, 405, WC_NONE, NULL, "use GET on a method, POST on its runs");
+        wb_printf(b, "{\"data\":");
+        write_method(b, m);
+        wb_printf(b, "}");
+        return 200;
+    }
+    if (!starts(rest, rl, "runs") || (rl > 4 && rest[4] != '/'))
+        return error(b, 404, WC_NONE, NULL, "unknown resource; use /wda/methods/{id}/runs");
+    if (rl > 4)                                           // one run: runs are not kept
+        return error(b, 404, WC_NONE, NULL, "runs are not stored: the POST answer holds the result (timeout 0)");
+    if (!post) {
+        if (method[0] != 'G')
+            return error(b, 405, WC_NONE, NULL, "use POST to run the method");
+        b->len = 0;                                       // runs are not kept: always empty
+        wb_printf(b, "{\"data\":[],\"meta\":{\"total\":0,\"offset\":0,\"count\":0}}");
+        return 200;
+    }
+    // result-behavior: sync (and auto, the default) run at once; async is not offered
+    for (size_t p = 0; p < qlen;) {
+        size_t e = p;
+        while (e < qlen && query[e] != '&')
+            e++;
+        if (e - p > 16 && memcmp(query + p, "result-behavior=", 16) == 0 &&
+            !span_eq(query + p + 16, e - p - 16, "sync") && !span_eq(query + p + 16, e - p - 16, "auto"))
+            return error(b, 400, WC_NONE, NULL, "result-behavior: only sync (or auto) is supported");
+        p = e + 1;
+    }
+    if (!has_jsonapi_content_type(req, len))
+        return error(b, 415, WC_NONE, NULL, "Content-Type must be application/vnd.api+json");
+    size_t blen = 0;
+    const char *body = body_of(req, len, &blen);
+    static const char *const k_type[] = { "data", "type" };
+    static const char *const k_args[] = { "data", "attributes", "inArgs" };
+    const char *v; size_t vl;
+    if (body == NULL || blen == 0)
+        return error(b, 400, WC_NONE, NULL, "no body");
+    if (jr_get(body, blen, k_type, 2, &v, &vl) != 0 || !span_eq(v, vl, "\"runs\""))
+        return error(b, 400, WC_NONE, "/data/type", "data.type must be \"runs\"");
+    if (jr_get(body, blen, k_args, 3, &v, &vl) != 0 || v[0] != '{')
+        return error(b, 400, WC_NONE, "/data/attributes/inArgs", "data.attributes.inArgs must be an object");
+    if (m == &methods[0])
+        return run_exchange(m, body, blen, cfg, control, b);
+    return run_readregister(m, body, blen, b);
+}
+
 int wda_handle(const char *req, size_t len, const gw_config_t *cfg, int control, wbuf_t *b)
 {
     const int patch = (len >= 6 && memcmp(req, "PATCH ", 6) == 0);
     const int get   = (len >= 4 && memcmp(req, "GET ", 4) == 0);
-    if (!patch && !get)
-        return error(b, 405, WC_NONE, NULL, "use GET or PATCH on /wda/parameters");
-    size_t pos = patch ? 6 : 4;
+    const int post  = (len >= 5 && memcmp(req, "POST ", 5) == 0);
+    if (!patch && !get && !post)
+        return error(b, 405, WC_NONE, NULL, "use GET or PATCH on /wda/parameters, POST on /wda/methods/{id}/runs");
+    size_t pos = patch ? 6 : post ? 5 : 4;
     size_t end = pos;
     while (end < len && req[end] != ' ' && req[end] != '\r' && req[end] != '\n')
         end++;
@@ -1695,12 +2282,18 @@ int wda_handle(const char *req, size_t len, const gw_config_t *cfg, int control,
 
     // GET /wda: service identity
     if (span_eq(path, plen, "/wda"))
-        return patch ? error(b, 405, WC_NONE, NULL, "use GET on /wda") : do_service_identity(b);
+        return !get ? error(b, 405, WC_NONE, NULL, "use GET on /wda") : do_service_identity(b);
+
+    // /wda/methods...: methods and their runs
+    if (span_eq(path, plen, "/wda/methods") || starts(path, plen, "/wda/methods/"))
+        return do_methods(req, req, len, path, plen, query, qlen, cfg, control, b);
+    if (post)
+        return error(b, 405, WC_NONE, NULL, "POST only on /wda/methods/{id}/runs");
 
     // /wda/parameter-definitions[/{id}]: read only
     static const char defs[] = "/wda/parameter-definitions";
     if (span_eq(path, plen, defs) || starts(path, plen, "/wda/parameter-definitions/")) {
-        if (patch)
+        if (!get)
             return error(b, 405, WC_NONE, NULL, "definitions are read-only");
         if (plen == sizeof(defs) - 1)
             return do_collection(defs, query, qlen, 1, cfg, b);

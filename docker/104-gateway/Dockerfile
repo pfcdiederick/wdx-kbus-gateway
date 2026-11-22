@@ -1,13 +1,13 @@
-# kbus-iec104: KBUS inputs of the kbus-gateway on an IEC 60870-5-104 server (port 2404).
+# 104-gateway: KBUS inputs of the kbus-gateway on an IEC 60870-5-104 server (port 2404).
 # Build context: the docker/ folder (for the shared lib/wdx_client.py). From the project root:
 #
-#   docker buildx build --platform linux/arm64 -f docker/iec104/Dockerfile -t kbus-iec104:arm64 --load docker
+#   docker buildx build --platform linux/arm64 -f docker/104-gateway/Dockerfile -t 104-gateway:arm64 --load docker
 #
-#   docker run -d --name kbus-iec104 --restart unless-stopped -p 2404:2404 \
-#       -v /run/kbus-gateway:/run/kbus-gateway kbus-iec104:arm64
+#   docker run -d --name 104-gateway --restart unless-stopped -p 2404:2404 \
+#       -v /run/kbus-gateway:/run/kbus-gateway 104-gateway:arm64
 #
-# Own parameter file without rebuilding: -v /home/kbus-iec104/wdx_iec104_config.ini:/app/wdx_iec104_config.ini
-# (tools/deploy-docker.sh <pfc-ip> --iec104 creates and mounts it).
+# Own parameter file without rebuilding: -v /home/104-gateway/wdx_iec104_config.ini:/app/wdx_iec104_config.ini
+# (tools/deploy-docker.sh <pfc-ip> --104-gateway creates and mounts it).
 #
 # Cross-build without emulation: the first stage runs on the PC's own platform and
 # downloads the prebuilt c104 wheel for the target; the final image only copies it
@@ -28,7 +28,7 @@ RUN case "$TARGETARCH" in \
 FROM python:3.10-slim
 WORKDIR /app
 COPY --from=wheels /deps /usr/local/lib/python3.10/site-packages
-COPY lib/wdx_client.py iec104/wdx_2_iec104.py iec104/wdx_iec104_config.ini ./
+COPY lib/wdx_client.py 104-gateway/wdx_2_iec104.py 104-gateway/wdx_iec104_config.ini ./
 EXPOSE 2404
 ENTRYPOINT ["python", "-u", "/app/wdx_2_iec104.py"]
 CMD ["--config", "/app/wdx_iec104_config.ini"]

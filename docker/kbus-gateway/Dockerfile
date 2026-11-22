@@ -2,18 +2,18 @@
 #
 # WAGO KBUS gateway as a container - multi-platform build with docker buildx.
 # Alternative to the native package (tools/build-ipk.sh); run it with
-# tools/deploy-docker.sh, which knows the mounts the KBUS access needs (README 2.8).
+# tools/deploy-docker.sh, which knows the mounts the KBUS access needs (docs/MANUAL.md 2.3).
 # The build context is the PROJECT ROOT (src/, web/, sdk/); ignore file:
 # Dockerfile.dockerignore next to this file. From the project root:
 #
 #   PFC300 (arm64):
-#     docker buildx build --platform linux/arm64 -f docker/gateway/Dockerfile \
+#     docker buildx build --platform linux/arm64 -f docker/kbus-gateway/Dockerfile \
 #         -t kbus-gateway:2.3.0-arm64 --load .
 #   PFC100 / PFC200 (armv7): --platform linux/arm/v7
 #
 #   Simulation image for a PC (no SDK headers needed):
 #     docker buildx build --platform linux/amd64 --build-arg REQUIRE_ADI=0 \
-#         -f docker/gateway/Dockerfile -t kbus-gateway:sim --load .
+#         -f docker/kbus-gateway/Dockerfile -t kbus-gateway:sim --load .
 #
 # The build stage always runs natively on the build host and cross-compiles;
 # the runtime stage has no RUN steps, so no QEMU emulation is required.
@@ -62,13 +62,13 @@ RUN set -eux; \
 # Runtime stage
 # ---------------------------------------------------------------------------
 # glibc of this image must be >= the PFC firmware's glibc, because the WAGO
-# libraries are loaded from the controller at runtime (see README).
+# libraries are loaded from the controller at runtime (see docs/MANUAL.md).
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 LABEL org.opencontainers.image.title="kbus-gateway" \
       org.opencontainers.image.description="WAGO KBUS DI/DO/AI/AO and shared registers as wdx data layer for containers"
 
 COPY --from=build /src/build/kbus-gateway /usr/local/bin/kbus-gateway
-COPY --chmod=755 docker/gateway/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=755 docker/kbus-gateway/entrypoint.sh /usr/local/bin/entrypoint.sh
 # check of the dashboard at /kbus, run by the entrypoint before the gateway starts
 COPY --chmod=644 docker/manager/kbus-dashboard-check.sh /usr/local/lib/kbus-gateway/kbus-dashboard-check.sh
 
